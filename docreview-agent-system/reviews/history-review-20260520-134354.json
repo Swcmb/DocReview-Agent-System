@@ -1,0 +1,17 @@
+{
+  "thread_id": "review-20260520-134354",
+  "spec_version": 1,
+  "review_conclusion": "Pass",
+  "total_llm_cost": 0.5,
+  "reports": [
+    {
+      "review_conclusion": "Pass",
+      "issues": [
+        {
+          "issue_id": "BK-1-1",
+          "severity": "Blocking"
+        }
+      ]
+    }
+  ]
+}

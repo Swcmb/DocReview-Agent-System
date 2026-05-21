@@ -3,11 +3,11 @@
 实现基于标准输入输出的 MCP (Model Context Protocol) 服务器，
 允许 AI 客户端通过 stdio 方式与 DocReview 智能体系统交互。
 
-协议规范：
+协议规范：https://modelcontextprotocol.io/specification/2024-11-05/
 - 通过标准输入读取 JSON 请求
 - 通过标准输出写入 JSON 响应
 - 每行一个 JSON 对象
-- 支持 list_tools 和 invoke 方法
+- 支持 tools/list 和 tools/call 方法
 
 配置方式：
 通过环境变量传递配置：
@@ -63,29 +63,44 @@ async def _get_runtime() -> Dict[str, Any]:
 
 
 async def list_tools() -> Dict[str, Any]:
-    """列出所有可用工具"""
+    """列出所有可用工具（符合 MCP 协议规范）"""
     tools = [
         {
             "name": "review_document",
+            "title": "文档审查",
             "description": "执行文档审查，对产品需求文档、技术方案等进行六步审查",
-            "parameters": {
-                "doc_path": {"type": "string", "description": "待审查文档路径", "optional": True},
-                "task": {"type": "string", "description": "任务描述", "optional": True},
-                "max_iterations": {"type": "integer", "description": "最大审查迭代次数", "default": 10}
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_path": {"type": "string", "description": "待审查文档路径"},
+                    "task": {"type": "string", "description": "任务描述"},
+                    "max_iterations": {"type": "integer", "description": "最大审查迭代次数"}
+                },
+                "required": []
             }
         },
         {
             "name": "generate_spec",
+            "title": "规格文档生成",
             "description": "根据任务描述生成结构化规格文档",
-            "parameters": {
-                "task": {"type": "string", "description": "任务描述", "required": True},
-                "document_content": {"type": "string", "description": "参考文档内容", "optional": True}
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "任务描述"},
+                    "document_content": {"type": "string", "description": "参考文档内容"}
+                },
+                "required": ["task"]
             }
         },
         {
             "name": "health_check",
+            "title": "健康检查",
             "description": "检查 MCP Server 健康状态",
-            "parameters": {}
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
         }
     ]
     return {"tools": tools}
@@ -110,18 +125,43 @@ async def review_document(doc_path: Optional[str] = None, task: Optional[str] = 
             reports.append(report)
             issues.extend(report.get("issues", []))
         
+        summary = f"审查完成！共发现 {len(issues)} 个问题"
+        if issues:
+            summary += ":\n" + "\n".join([f"- {issue.get('description', '')}" for issue in issues[:5]])
+            if len(issues) > 5:
+                summary += f"\n...（还有 {len(issues) - 5} 个问题）"
+        
         return {
-            "success": True,
-            "review_conclusion": result.get("review_conclusion", "unknown"),
-            "iteration_count": result.get("iteration_count", 0),
-            "total_llm_cost": result.get("total_llm_cost", 0.0),
-            "issues": issues,
-            "reports": reports
+            "content": [
+                {
+                    "type": "text",
+                    "text": summary
+                }
+            ],
+            "metadata": {
+                "success": True,
+                "review_conclusion": result.get("review_conclusion", "unknown"),
+                "iteration_count": result.get("iteration_count", 0),
+                "total_llm_cost": result.get("total_llm_cost", 0.0),
+                "issue_count": len(issues),
+                "reports": reports
+            }
         }
     
     except Exception as e:
         logger.error(f"审查失败: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"审查失败: {str(e)}"
+                }
+            ],
+            "metadata": {
+                "success": False,
+                "error": str(e)
+            }
+        }
 
 
 async def generate_spec(task: str, document_content: Optional[str] = None) -> Dict[str, Any]:
@@ -140,15 +180,35 @@ async def generate_spec(task: str, document_content: Optional[str] = None) -> Di
         
         state = await supervisor.generate_spec(initial_state)
         
+        specification = state.get("specification", "")
+        
         return {
-            "success": True,
-            "specification": state.get("specification", ""),
-            "spec_version": state.get("spec_version", 1)
+            "content": [
+                {
+                    "type": "text",
+                    "text": specification
+                }
+            ],
+            "metadata": {
+                "success": True,
+                "spec_version": state.get("spec_version", 1)
+            }
         }
     
     except Exception as e:
         logger.error(f"规格生成失败: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"规格生成失败: {str(e)}"
+                }
+            ],
+            "metadata": {
+                "success": False,
+                "error": str(e)
+            }
+        }
 
 
 async def health_check() -> Dict[str, Any]:
@@ -160,18 +220,36 @@ async def health_check() -> Dict[str, Any]:
             "sequential_thinking": not runtime.get("seq_thinking", {}).is_degraded if hasattr(runtime.get("seq_thinking"), "is_degraded") else False,
             "context7": not runtime.get("context7", {}).is_degraded if hasattr(runtime.get("context7"), "is_degraded") else False
         }
+        
+        status_text = "服务正常运行"
         return {
-            "status": "healthy",
-            "llm_available": llm_available,
-            "mcp_services": mcp_services
+            "content": [
+                {
+                    "type": "text",
+                    "text": status_text
+                }
+            ],
+            "metadata": {
+                "status": "healthy",
+                "llm_available": llm_available,
+                "mcp_services": mcp_services
+            }
         }
     except Exception as e:
         logger.error(f"健康检查失败: {e}")
         return {
-            "status": "unhealthy",
-            "llm_available": False,
-            "mcp_services": {"sequential_thinking": False, "context7": False},
-            "error": str(e)
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"服务异常: {str(e)}"
+                }
+            ],
+            "metadata": {
+                "status": "unhealthy",
+                "llm_available": False,
+                "mcp_services": {"sequential_thinking": False, "context7": False},
+                "error": str(e)
+            }
         }
 
 
@@ -184,11 +262,22 @@ async def invoke_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, An
     elif tool_name == "health_check":
         return await health_check()
     else:
-        return {"success": False, "error": f"未知工具: {tool_name}"}
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"未知工具: {tool_name}"
+                }
+            ],
+            "metadata": {
+                "success": False,
+                "error": f"未知工具: {tool_name}"
+            }
+        }
 
 
 async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
-    """处理单个请求"""
+    """处理单个请求（符合 MCP 协议规范）"""
     request_id = request.get("id")
     method = request.get("method")
     params = request.get("params", {})
@@ -196,7 +285,27 @@ async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
     logger.debug(f"收到请求: id={request_id}, method={method}")
     
     try:
-        if method == "list_tools":
+        if method == "initialize":
+            """初始化连接 - MCP 客户端在连接时调用"""
+            logger.info("客户端初始化连接")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "DocReview MCP Server",
+                        "version": "1.0.0",
+                        "description": "智能文档审查代理系统"
+                    }
+                }
+            }
+        
+        elif method == "tools/list":
+            """列出可用工具"""
             result = await list_tools()
             return {
                 "jsonrpc": "2.0",
@@ -204,15 +313,10 @@ async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 "result": result
             }
         
-        elif method == "invoke":
-            # params 可能是列表或对象
-            if isinstance(params, list) and len(params) > 0:
-                tool_call = params[0] if params else {}
-            else:
-                tool_call = params.get("tool", params)
-            
-            tool_name = tool_call.get("name")
-            arguments = tool_call.get("arguments", {})
+        elif method == "tools/call":
+            """调用工具"""
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
             
             if not tool_name:
                 return {
@@ -249,13 +353,8 @@ async def stdio_server():
     logger.info("启动 DocReview MCP Server (stdio 模式)")
     logger.info("配置已从环境变量加载")
     
-    # 初始化运行时
-    try:
-        await _get_runtime()
-        logger.info("工作流运行时初始化完成")
-    except Exception as e:
-        logger.error(f"运行时初始化失败: {e}", exc_info=True)
-        # 继续运行，后续请求可能会失败但服务器仍可响应
+    # 初始化运行时（异步）
+    asyncio.create_task(_initialize_runtime())
     
     # 读取输入并处理
     loop = asyncio.get_event_loop()
@@ -278,7 +377,6 @@ async def stdio_server():
                 request = json.loads(line)
             except json.JSONDecodeError as e:
                 logger.error(f"无效的 JSON: {e}")
-                # 输出错误响应
                 response = {
                     "jsonrpc": "2.0",
                     "id": None,
@@ -300,6 +398,15 @@ async def stdio_server():
             break
         except Exception as e:
             logger.error(f"服务器运行错误: {e}", exc_info=True)
+
+
+async def _initialize_runtime():
+    """异步初始化运行时"""
+    try:
+        await _get_runtime()
+        logger.info("工作流运行时初始化完成")
+    except Exception as e:
+        logger.error(f"运行时初始化失败: {e}", exc_info=True)
 
 
 def main():

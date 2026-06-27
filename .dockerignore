@@ -1,0 +1,49 @@
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment (运行时注入，不打包进镜像)
+.env
+
+# Runtime artifacts
+logs/
+data/
+reviews/history-*.json
+*.db
+*.db-journal
+*.db.bak
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code / Trae
+.claude/
+.trae/
+
+# Node
+node_modules/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore

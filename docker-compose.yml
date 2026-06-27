@@ -1,0 +1,38 @@
+# DocReview Agent System — Docker Compose
+# 用法:
+#   docker compose build                     # 构建镜像
+#   docker compose up -d docreview-server    # 启动 HTTP MCP Server
+#   docker compose run --rm docreview-test   # 运行测试
+#   docker compose down                      # 停止并清理
+
+services:
+  # ---- HTTP MCP Server（主服务） ----
+  docreview-server:
+    build: .
+    container_name: docreview-server
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - docreview-data:/app/data
+      - docreview-logs:/app/logs
+    restart: unless-stopped
+
+  # ---- 测试（一次性任务） ----
+  docreview-test:
+    build: .
+    container_name: docreview-test
+    entrypoint: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=WARNING
+    profiles:
+      - test
+
+volumes:
+  docreview-data:
+    driver: local
+  docreview-logs:
+    driver: local

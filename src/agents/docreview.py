@@ -26,7 +26,6 @@ except ImportError:
         BaseChatModel = Any
 from langchain.schema import HumanMessage
 
-from ..mcp.context7 import Context7Client
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import (
     AgentState,
@@ -92,70 +91,85 @@ SEVERITY_HIGH = "High"
 SEVERITY_MEDIUM = "Medium"
 SEVERITY_LOW = "Low"
 
+# 结构化输出格式规范 — 嵌入所有 LLM 调用中，确保解析器可工作
+STRUCTURED_OUTPUT_FORMAT = """
+输出格式要求（严格遵循）：
+- 问题: [ISSUE] type=<CoreProcessBreak|ConsistencyCheck|RequirementCompleteness|TechnicalFeasibility|RiskDetection|ExecutabilityReview> severity=<Blocking|High|Medium|Low> description=<描述> location=<位置> suggestion=<建议>
+- 需求: [FR-N] <描述> priority=<P0|P1|P2>
+- 依赖: [DEP] <源> depends_on <目标>
+- 验收: [AC-N] covers=<FR-ID列表> criteria=<标准>
+- 流程: [FLOW] <流程描述>
+- 缺失: [GAP] <缺失描述>
+
+每条信息独占一行。如无对应信息，不输出该类型行。
+"""
+
+# 内联审查提示词 — 六步审查方法论
+REVIEW_SYSTEM_PROMPT = """You are DocReview, a professional document review agent.
+
+## 六步审查方法论
+
+对给定的规格文档依次执行以下六个审查步骤：
+
+### Step 1: 核心闭环提取 (CoreProcessBreak)
+识别文档中的主业务流程，检查入口点、出口点和流程断点。
+
+### Step 2: 一致性检查 (ConsistencyCheck)
+检查文档内部逻辑一致性、术语使用一致性、数据引用一致性。
+
+### Step 3: 需求原子化 (RequirementCompleteness)
+将需求分解为可独立验证的原子单元，检查功能需求是否都有对应的验收标准。
+
+### Step 4: 技术可行性 (TechnicalFeasibility)
+评估技术方案的可行性、依赖关系和技术风险。
+
+### Step 5: 风险检测 (RiskDetection)
+识别技术风险、业务风险、依赖风险、时间风险。
+
+### Step 6: 可执行性审查 (ExecutabilityReview)
+从开发者视角评估：需求是否可实现、验收标准是否可测试、文档是否足以指导开发。
+
+## 严重级别分类指南
+- **Blocking**: 阻塞项目推进，必须修复（如核心流程断点、关键需求缺失）
+- **High**: 严重影响质量，强烈建议修复（如技术可行性问题、重大风险）
+- **Medium**: 影响质量但有变通方案（如格式不一致、次要需求不完整）
+- **Low**: 改进建议，不影响核心功能（如措辞优化、格式美化）
+
+""" + STRUCTURED_OUTPUT_FORMAT
+
 
 class DocReviewAgent:
     """DocReview Sub-Agent
-    
-    核心审查智能体，执行六步审查流程：
-    1. 核心闭环提取
-    2. 一致性检查
-    3. 需求原子化
-    4. 技术可行性
-    5. 风险检测
-    6. 可执行性审查
-    
+
+    核心审查智能体，执行六步审查流程。
+    提示词已内联为 REVIEW_SYSTEM_PROMPT 常量，结构化输出格式见 STRUCTURED_OUTPUT_FORMAT。
+
     Attributes:
         llm: 语言模型实例
         sequential_thinking: Sequential Thinking MCP 客户端（可选）
-        context7: Context7 MCP 客户端（可选）
         tools: 可用工具列表
-        review_prompt: 审查提示词
-        whentocall_prompt: 调用条件提示词
     """
-    
-    PROMPT_PATH = ".trae/prompts/docreview-agent-system/agent-review-prompt.md"
-    WHENTOCALL_PATH = ".trae/prompts/docreview-agent-system/agent-invocation-rules.md"
-    
+
     def __init__(
         self,
         llm: BaseChatModel,
         sequential_thinking: Optional[SequentialThinkingClient] = None,
-        context7: Optional[Context7Client] = None,
+        context7: Any = None,
         tools: Optional[List[BaseTool]] = None,
     ) -> None:
         """初始化 DocReview Agent
-        
+
         Args:
             llm: 语言模型实例
-            sequential_thinking: Sequential Thinking MCP 客户端
-            context7: Context7 MCP 客户端
+            sequential_thinking: Sequential Thinking MCP 客户端（可选）
+            context7: 保留参数以兼容，实际不再使用
             tools: 可用工具列表
         """
         self.llm = llm
         self.sequential_thinking = sequential_thinking
-        self.context7 = context7
         self.tools = tools or []
         self.logger = logger
-        
-        self.review_prompt = self._load_prompt_safe(self.PROMPT_PATH)
-        self.whentocall_prompt = self._load_prompt_safe(self.WHENTOCALL_PATH)
-    
-    def _load_prompt_safe(self, path: str) -> str:
-        """安全加载提示词文件
-        
-        Args:
-            path: 提示词文件路径
-            
-        Returns:
-            提示词内容，文件不存在时返回空字符串
-        """
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except FileNotFoundError:
-            self.logger.warning(f"提示词文件未找到: {path}")
-            return ""
-    
+
     async def review(self, state: AgentState) -> AgentState:
         """执行完整的六步审查流程
         
@@ -284,48 +298,35 @@ class DocReviewAgent:
         Returns:
             LLM 生成的推理结果
         """
-        prompt = f"""请对以下内容进行{step_name}分析：
+        prompt = f"""{REVIEW_SYSTEM_PROMPT}
+
+请对以下内容进行{step_name}分析：
 
 {context}
 
-请提供结构化的分析结果。"""
+{STRUCTURED_OUTPUT_FORMAT}"""
         response = await self.llm.agenerate([HumanMessage(content=prompt)])
         return response.generations[0][0].text.strip()
     
     async def _enrich_context(self, spec: str) -> Optional[TechContext]:
-        """通过 Context7 MCP 获取技术上下文
-        
-        从规格文档中提取技术栈信息，查询相关文档和最佳实践。
-        
+        """从规格文档提取技术上下文（纯文本分析，不依赖外部服务）
+
         Args:
             spec: 规格文档内容
-            
+
         Returns:
-            技术上下文对象，获取失败时返回 None
+            技术上下文对象，未找到技术栈时返回 None
         """
-        if not self.context7 or self.context7.is_degraded:
+        tech_stack = self._extract_tech_stack(spec)
+        if not tech_stack:
             return None
-        
-        try:
-            tech_stack = self._extract_tech_stack(spec)
-            
-            if not tech_stack:
-                return None
-            
-            library_id = await self.context7.resolve_library_id(tech_stack)
-            
-            docs = await self.context7.query_docs("best practices", library_id)
-            
-            return TechContext(
-                library_name=tech_stack,
-                relevant_docs=[d.snippet for d in docs],
-                best_practices=self._extract_best_practices(docs),
-                common_pitfalls=[],
-            )
-            
-        except Exception as e:
-            self.logger.warning(f"Context7 调用失败: {e}")
-            return None
+
+        return TechContext(
+            library_name=tech_stack,
+            relevant_docs=[],
+            best_practices=[],
+            common_pitfalls=[],
+        )
     
     def _extract_tech_stack(self, spec: str) -> str:
         """从规格文档提取技术栈
@@ -349,21 +350,7 @@ class DocReviewAgent:
                 return match.group(1).strip() if len(match.groups()) > 0 else match.group(0)
         return ""
     
-    def _extract_best_practices(self, docs: List[Any]) -> List[str]:
-        """从文档结果中提取最佳实践
-        
-        Args:
-            docs: 文档结果列表
-            
-        Returns:
-            最佳实践列表
-        """
-        practices = []
-        for doc in docs:
-            if hasattr(doc, "snippet") and doc.snippet:
-                practices.append(doc.snippet[:100])
-        return practices[:5]
-    
+
     async def _extract_core_loop(self, spec: str) -> CoreLoopAnalysis:
         """步骤 1：核心闭环提取
         
@@ -663,27 +650,53 @@ class DocReviewAgent:
         )
     
     def _check_ac_coverage(self, spec: str, issues: List[IssueStatus]) -> bool:
-        """检查 AC 覆盖率
-        
+        """检查 AC 覆盖率（支持 6 种格式变体）
+
         验证 P0 功能需求是否被验收标准覆盖。
-        
+
+        支持的 P0 标记格式：
+        - **FR-N**(P0)    - FR-N (P0)    - FR-N: P0
+        - FR-N - P0       - FR-N [P0]    - **FR-N**: 优先级 P0
+
         Args:
             spec: 规格文档内容
             issues: 问题列表
-            
+
         Returns:
-            覆盖率是否完整
+            覆盖率是否完整（所有 P0 FR 均有对应 AC）
         """
-        p0_frs = re.findall(r"\*\*FR-(\d+)\*\*.*?\(P0\)", spec, re.DOTALL)
-        
+        # 提取所有 P0 功能需求 ID
+        p0_patterns = [
+            r"\*\*FR-(\d+)\*\*.*?\(P0\)",
+            r"FR-(\d+)\s*\(P0\)",
+            r"FR-(\d+)\s*[:：]\s*P0",
+            r"FR-(\d+)\s*-\s*P0",
+            r"FR-(\d+)\s*\[P0\]",
+            r"\*\*FR-(\d+)\*\*.*?优先级.*?P0",
+        ]
+        p0_frs: set[str] = set()
+        for pattern in p0_patterns:
+            p0_frs.update(re.findall(pattern, spec, re.IGNORECASE | re.DOTALL))
+
+        # 若无 P0 需求，检查是否有任何 FR
         if not p0_frs:
-            fr_matches = re.findall(r"\*\*FR-(\d+)\*\*", spec)
-            if fr_matches:
-                return True
-        
+            any_fr = re.findall(r"FR-(\d+)", spec)
+            return bool(any_fr)  # 有 FR 但无 P0 标记，默认通过
+
+        # 提取所有 AC 覆盖的 FR 列表
+        ac_frs: set[str] = set()
+        # [AC-N] covers=FR-1,FR-2 格式
+        for m in re.findall(r"\[AC-\d+\]\s*covers?=(.+?)(?:\s|$)", spec, re.IGNORECASE):
+            ac_frs.update(re.findall(r"FR-(\d+)", m))
+        # **AC-N** 格式（传统）
         ac_matches = re.findall(r"\*\*AC-(\d+)\*\*", spec)
-        
-        return len(ac_matches) > 0 if p0_frs else True
+
+        # 有 AC 覆盖的 FR 或有 AC 编号即视为有覆盖
+        covered = ac_frs or ac_matches
+        if not covered:
+            return False
+
+        return p0_frs.issubset(ac_frs) if ac_frs else bool(ac_matches)
     
     def _parse_issues_from_text(
         self,
@@ -691,64 +704,127 @@ class DocReviewAgent:
         expected_types: List[str],
         default_severity: str,
     ) -> List[IssueStatus]:
-        """从文本中解析问题列表
-        
-        使用模式匹配从 LLM 输出中提取问题信息。
-        
+        """从文本中解析问题列表（双路径策略 + 质量门控）
+
+        优先解析 [ISSUE] 结构化格式，降级到宽松模式匹配。
+
         Args:
             text: LLM 生成的文本
             expected_types: 预期的问题类型列表
             default_severity: 默认严重级别
-            
+
         Returns:
-            解析出的问题列表
+            解析出的问题列表（最多 20 条，超出截断并记录警告）
         """
+        issues = self._parse_structured_issues(text)
+        if not issues:
+            issues = self._parse_loose_issues(text, expected_types, default_severity)
+
+        # 质量门控：单次超过 20 条视为误报
+        max_issues = 20
+        if len(issues) > max_issues:
+            self.logger.warning(f"解析到 {len(issues)} 条 issue，截断至 {max_issues} 条（疑似误报）")
+            issues = issues[:max_issues]
+
+        return issues
+
+    def _parse_structured_issues(self, text: str) -> List[IssueStatus]:
+        """解析 [ISSUE] 结构化格式"""
+        pattern = r"\[ISSUE\]\s*type=(\S+)\s*severity=(\S+)\s*description=(.+?)\s*location=(.+?)\s*suggestion=(.+?)(?:\n|$)"
+        matches = re.findall(pattern, text, re.IGNORECASE)
         issues = []
-        
+        for m in matches:
+            issues.append(IssueStatus(
+                issue_id="",
+                severity=m[1] if m[1] in (SEVERITY_BLOCKING, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW) else SEVERITY_MEDIUM,
+                issue_type=m[0],
+                description=m[2].strip()[:200],
+                suggestion=m[4].strip(),
+                location=m[3].strip(),
+                status="open",
+            ))
+        return issues
+
+    def _parse_loose_issues(
+        self,
+        text: str,
+        expected_types: List[str],
+        default_severity: str,
+    ) -> List[IssueStatus]:
+        """降级：宽松模式匹配"""
+        issues = []
         patterns = [
             r"(问题|issue)[\s:：]+(.+?)(?=\n\n|\n$|$)",
             r"(风险|risk)[\s:：]+(.+?)(?=\n\n|\n$|$)",
             r"(缺失|gap|missing)[\s:：]+(.+?)(?=\n\n|\n$|$)",
         ]
-        
         for pattern in patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             for match in matches:
-                issues.append(
-                    IssueStatus(
-                        issue_id="",
-                        severity=default_severity,
-                        issue_type=expected_types[0] if expected_types else ISSUE_TYPES["CONSISTENCY"],
-                        description=match[1].strip()[:200],
-                        suggestion="请根据问题描述进行修订",
-                        location="规格文档",
-                        status="open",
-                    )
-                )
-        
+                issues.append(IssueStatus(
+                    issue_id="",
+                    severity=default_severity,
+                    issue_type=expected_types[0] if expected_types else ISSUE_TYPES["CONSISTENCY"],
+                    description=match[1].strip()[:200],
+                    suggestion="请根据问题描述进行修订",
+                    location="规格文档",
+                    status="open",
+                ))
         return issues
-    
+
     def _parse_atomic_requirements(self, text: str) -> List[AtomicRequirement]:
-        """从文本中解析原子化需求
-        
+        """从文本中解析原子化需求（[FR-N] 格式 + 宽松匹配）
+
         Args:
             text: LLM 生成的文本
-            
+
         Returns:
             原子化需求列表
         """
-        return []
-    
+        reqs = []
+        # 结构化格式: [FR-N] description priority=P0
+        structured = re.findall(r"\[FR-(\d+)\]\s*(.+?)(?:\s+priority=(P[012]))?(?:\n|$)", text, re.IGNORECASE)
+        for m in structured:
+            reqs.append(AtomicRequirement(
+                id=f"FR-{m[0]}",
+                description=m[1].strip(),
+                priority=m[2] if m[2] else "P1",
+            ))
+        # 降级: **FR-N** 格式
+        if not reqs:
+            loose = re.findall(r"\*\*FR-(\d+)\*\*[：:]*\s*(.+?)(?:\n|$)", text)
+            for m in loose:
+                reqs.append(AtomicRequirement(
+                    id=f"FR-{m[0]}",
+                    description=m[1].strip(),
+                    priority="P1",
+                ))
+        return reqs
+
     def _parse_dependency_graph(self, text: str) -> Dict[str, Any]:
-        """从文本中解析依赖关系图
-        
+        """从文本中解析依赖关系图（[DEP] 格式 + 宽松匹配）
+
         Args:
             text: LLM 生成的文本
-            
+
         Returns:
-            依赖关系图
+            依赖关系图 {"nodes": [...], "edges": [...]}
         """
-        return {"nodes": [], "edges": []}
+        nodes = set()
+        edges = []
+        # 结构化格式: [DEP] source depends_on target
+        structured = re.findall(r"\[DEP\]\s*(\S+)\s+depends_on\s+(\S+)", text, re.IGNORECASE)
+        for src, dst in structured:
+            nodes.add(src)
+            nodes.add(dst)
+            edges.append({"from": src, "to": dst})
+        # 降级: "依赖"/"depends on" 关键词
+        if not edges:
+            loose = re.findall(r"(?:依赖|depends?\s+on|requires?)\s*[：:]*\s*(\S+)", text, re.IGNORECASE)
+            for dep in loose:
+                nodes.add(dep)
+                edges.append({"from": "unknown", "to": dep})
+        return {"nodes": list(nodes), "edges": edges}
     
     def _extract_list_from_text(self, text: str, keywords: List[str]) -> List[str]:
         """从文本中提取包含关键词的行

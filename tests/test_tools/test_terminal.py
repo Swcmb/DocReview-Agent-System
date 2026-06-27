@@ -72,7 +72,10 @@ async def test_execute_command_with_working_directory(
     )
 
     assert result.success is True
-    assert str(temp_dir) in result.data.get("stdout", "")
+    # 跨平台：pwd 可能返回 Unix 风格路径（Git Bash）或 Windows 路径
+    stdout = result.data.get("stdout", "")
+    temp_name = temp_dir.name
+    assert temp_name in stdout
 
 
 @pytest.mark.asyncio

@@ -204,33 +204,18 @@ async def load_document(state: AgentState) -> AgentState:
     return state
 
 
-async def generate_spec(state: AgentState) -> AgentState:
-    """生成或转换规格文档
+def user_approval(state: AgentState) -> AgentState:
+    """用户确认节点（中断点）
 
-    调用 SupervisorAgent 执行
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        更新后的状态，包含 specification 和 spec_version
-    """
-    logger.info("生成规格文档")
-    return state
-
-
-async def docreview(state: AgentState) -> AgentState:
-    """执行文档审查
-
-    调用 DocReviewAgent 执行六步审查
+    LangGraph 将在此节点中断，等待用户输入
 
     Args:
         state: 当前工作流状态
 
     Returns:
-        更新后的状态，包含 review_reports 和 review_conclusion_data
+        当前状态
     """
-    logger.info("执行文档审查")
+    logger.info("等待用户确认")
     return state
 
 
@@ -306,21 +291,6 @@ def route_after_evaluate(state: AgentState) -> Literal["user_approval", "revise_
         return "user_approval"
 
     return "revise_spec"
-
-
-async def revise_spec(state: AgentState) -> AgentState:
-    """修订规格文档
-
-    调用 SupervisorAgent 执行
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        更新后的状态
-    """
-    logger.info("修订规格文档")
-    return state
 
 
 def user_approval(state: AgentState) -> AgentState:

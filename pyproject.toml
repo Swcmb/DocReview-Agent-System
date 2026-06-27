@@ -62,6 +62,9 @@ addopts = [
     "--tb=short",
     "--strict-markers",
 ]
+markers = [
+    "asyncio: mark a test as an asyncio test",
+]
 
 [tool.coverage.run]
 source = ["src"]

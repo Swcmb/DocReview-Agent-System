@@ -132,68 +132,12 @@ class Context7Client(BaseMCPClient):
         library_id: Optional[str] = None,
         num_results: int = 5
     ) -> List[DocResult]:
-        """查询文档
-        
-        Args:
-            query: 查询内容
-            library_id: 库标识符（可选）
-            num_results: 返回结果数量
-            
-        Returns:
-            List[DocResult]: 文档查询结果列表
+        """查询文档（当前为降级模式，返回空结果）
+
+        Context7 MCP 集成已移除，此方法仅记录降级日志并返回空列表。
         """
-        if library_id:
-            # 使用 Context7 API 查询（如果有 API key）
-            return await self._query_context7_api(query, library_id, num_results)
-        else:
-            # 回退到本地解析
-            return self._fallback_query(query, num_results)
-    
-    async def _query_context7_api(
-        self,
-        query: str,
-        library_id: str,
-        num_results: int
-    ) -> List[DocResult]:
-        """通过 Context7 API 查询"""
-        try:
-            # 实际实现应使用 Context7 MCP Server 或 API
-            # 这里使用模拟数据作为示例
-            results = [
-                DocResult(
-                    library_id=library_id,
-                    library_name=library_id.split("/")[-1],
-                    snippet=f"关于 '{query}' 的文档内容...",
-                    url=f"https://docs.example.com/{query}"
-                )
-                for _ in range(num_results)
-            ]
-            return results
-        except Exception as e:
-            self.logger.error(f"Context7 API 查询失败: {e}")
-            return self._fallback_query(query, num_results)
-    
-    def _fallback_query(
-        self,
-        query: str,
-        num_results: int
-    ) -> List[DocResult]:
-        """本地回退查询"""
-        # 当 MCP 不可用时，提供基本的信息
-        results = []
-        keywords = query.lower().split()
-        
-        for keyword in keywords[:2]:
-            results.append(
-                DocResult(
-                    library_id=f"/search/{keyword}",
-                    library_name=keyword.title(),
-                    snippet=f"关于 '{keyword}' 的本地缓存信息。在线查询请确保 MCP 服务可用。",
-                    url=None
-                )
-            )
-        
-        return results[:num_results]
+        self.logger.debug(f"Context7 处于降级模式，跳过查询: {query}")
+        return []
     
     async def get_context(self, topic: str) -> ContextResult:
         """获取上下文信息

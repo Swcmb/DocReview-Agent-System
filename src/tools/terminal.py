@@ -1,8 +1,11 @@
 """终端工具模块 / Terminal Tool Module
 
 提供终端命令执行能力的工具，支持超时、重试、白名单/黑名单安全检查。
+支持通过 async_execute 方法在异步上下文中非阻塞执行。
 """
 
+import asyncio
+import functools
 import re
 import subprocess
 import time
@@ -214,3 +217,19 @@ class TerminalTool(BaseTool):
                     return False, f"命令不在白名单中: {first_word}"
 
         return True, None
+
+    async def async_execute(self, command: str, **kwargs) -> ToolResult:
+        """异步执行终端命令（通过 run_in_executor 避免阻塞事件循环）
+
+        Args:
+            command: 要执行的命令
+            **kwargs: 传递给 execute 的参数
+
+        Returns:
+            ToolResult: 命令执行结果
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(self.execute, command, **kwargs)
+        )

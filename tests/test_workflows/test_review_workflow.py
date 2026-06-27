@@ -1,7 +1,6 @@
 """审查工作流测试模块 / Review Workflow Test Module"""
 
 import pytest
-import pytest_asyncio
 
 from src.workflows.review_workflow import (
     build_workflow,

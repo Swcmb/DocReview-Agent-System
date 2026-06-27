@@ -1,1 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 环境
 .env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 项目运行时
+logs/
+data/
+reviews/history-*.json
+*.db
+*.db-journal
+*.db.bak
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Trae (外部提示词目录)
+.trae/
+
+# Claude Code
+.claude/

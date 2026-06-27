@@ -30,11 +30,11 @@ class PromptLoader:
     支持旧文件名到新规范路径的自动映射（向后兼容）。
     """
 
-    # 默认提示词目录 - 指向项目根目录下的 .trae/prompts 文件夹（新规范）
-    DEFAULT_PROMPTS_DIR = Path(__file__).parent.parent.parent / ".trae" / "prompts"
+    # 默认提示词目录 - 指向项目根目录下的 prompts 文件夹
+    DEFAULT_PROMPTS_DIR = Path(__file__).parent.parent.parent / "prompts"
 
     # 旧文件名 → 新路径的映射表（向后兼容）
-    # key: 旧文件名，value: 相对于 .trae/prompts/ 的新路径
+    # key: 旧文件名，value: 相对于 prompts/ 的路径
     FILENAME_MAPPING = {
         "PROMPT.md": "docreview-agent-system/agent-review-prompt.md",
         "WHENTOCALL.md": "docreview-agent-system/agent-invocation-rules.md",

@@ -398,7 +398,11 @@ def test_parse_issues_never_raises_on_empty_text():
 
 
 def test_markdown_report_sorts_by_severity_descending_priority():
-    """特征化：按 Blocking→High→Medium→Low 排序渲染（`docreview.py:566-576`）。"""
+    """按 Blocking→High→Medium→Low 排序渲染（仅展示顺序）。
+
+    T-14 起排序不再参与 ID 编号：ID 已由 `assign_issue_ids()` 在上游按**输入
+    顺序**分配完毕，故此处不再断言 `BK-3-1` 之类由编译器生成的 ID。
+    """
     agent = _FakeAgent()
     issues: list[IssueStatus] = [
         {**_mk_issue(SEVERITY_LOW), "description": "low-1"},
@@ -407,27 +411,27 @@ def test_markdown_report_sorts_by_severity_descending_priority():
     ]
     md = agent._compile_markdown_report(issues, 3)
     assert md.index("block-1") < md.index("med-1") < md.index("low-1")
-    assert "BK-3-1" in md
 
 
 def test_markdown_report_preserves_existing_issue_ids():
-    """特征化：已有非空 issue_id 的条目不被覆盖（`docreview.py:581`）。"""
+    """已有非空 issue_id 的条目不被覆盖。"""
     agent = _FakeAgent()
     issues: list[IssueStatus] = [{**_mk_issue(SEVERITY_MEDIUM), "issue_id": "MD-9-9"}]
     agent._compile_markdown_report(issues, 1)
     assert issues[0]["issue_id"] == "MD-9-9"
 
 
-def test_markdown_report_mutates_input_assigning_ids():
-    """特征化（**已知副作用**）：当前实现会**就地修改**传入的 issues 字典。
+def test_markdown_report_does_not_mutate_input():
+    """T-14 已落地：Markdown 编译器**无业务副作用**（§3.3 item 6）。
 
-    规格 §3.3 item 6／T-14 要求 Markdown 编译器无副作用。本测试固定重构前的
-    行为，作为该重构的出发点；重构完成后应改为断言 `issues` 不被修改。
+    本测试原为 `test_markdown_report_mutates_input_assigning_ids`，锁定重构前
+    「就地写回 issue_id」的行为，其 docstring 明确要求重构完成后改为断言
+    `issues` 不被修改。ID 分配已迁移到独立的 `assign_issue_ids()`。
     """
     agent = _FakeAgent()
-    issues = [_mk_issue(SEVERITY_BLOCKING)]
+    issues: list[IssueStatus] = [{**_mk_issue(SEVERITY_BLOCKING), "issue_id": ""}]
     agent._compile_markdown_report(issues, 2)
-    assert issues[0]["issue_id"] == "BK-2-1", "当前实现确实会写回 issue_id"
+    assert issues[0]["issue_id"] == "", "编译器不得分配或写回 issue_id"
 
 
 # ─────────────── 辅助解析器 ───────────────

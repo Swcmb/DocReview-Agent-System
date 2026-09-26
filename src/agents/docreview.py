@@ -27,7 +27,13 @@ except ImportError:
 from langchain.schema import HumanMessage
 
 from ..mcp.sequential_thinking import SequentialThinkingClient
+from ..decisions.issue_id import assign_issue_ids
 from ..schemas.models import (
+    SEVERITY_BLOCKING,
+    SEVERITY_HIGH,
+    SEVERITY_LOW,
+    SEVERITY_MEDIUM,
+    SEVERITY_ORDER,
     AgentState,
     IssueStatus,
     ReviewConclusion,
@@ -86,10 +92,7 @@ ISSUE_TYPES = {
     "EXECUTABILITY": "ExecutabilityReview",
 }
 
-SEVERITY_BLOCKING = "Blocking"
-SEVERITY_HIGH = "High"
-SEVERITY_MEDIUM = "Medium"
-SEVERITY_LOW = "Low"
+# severity 词表与展示顺序统一由 `src.schemas.models` 提供，避免两处定义漂移。
 
 # 结构化输出格式规范 — 嵌入所有 LLM 调用中，确保解析器可工作
 STRUCTURED_OUTPUT_FORMAT = """
@@ -216,6 +219,11 @@ class DocReviewAgent:
                 + risk_issues
                 + exec_issues
             )
+
+            # §3.3 步骤 2：ID 必须在任何审计/结论/报告之前独立分配完毕。
+            # 顺序很重要——verify_issues/verify_resolutions 只消费已分配 ID 的
+            # 快照，Markdown 编译器也不再分配。
+            assign_issue_ids(all_issues, iteration)
             
             markdown_report = self._compile_markdown_report(all_issues, iteration)
             
@@ -553,39 +561,22 @@ class DocReviewAgent:
         iteration: int,
     ) -> str:
         """生成 Markdown 格式的审查报告
-        
-        按严重程度排序并分配 issue_id。
-        
+
+        §3.3 步骤 6：本方法**只渲染**。它不分配 issue_id、不修改 issues、
+        不修改 tracker、不写 state——ID 已由 `assign_issue_ids()` 在流程上游
+        分配完毕。排序仅决定展示顺序，不再参与 ID 编号。
+
         Args:
-            issues: 问题列表
-            iteration: 当前迭代轮次
-            
+            issues: 已分配 ID 的问题列表
+            iteration: 当前迭代轮次（仅用于报告头部信息）
+
         Returns:
             Markdown 格式的审查报告
         """
-        severity_order = {
-            SEVERITY_BLOCKING: 0,
-            SEVERITY_HIGH: 1,
-            SEVERITY_MEDIUM: 2,
-            SEVERITY_LOW: 3,
-        }
-        
         sorted_issues = sorted(
             issues,
-            key=lambda x: severity_order.get(x["severity"], 99),
+            key=lambda x: SEVERITY_ORDER.get(x["severity"], 99),
         )
-        
-        severity_counters = {SEVERITY_BLOCKING: 0, SEVERITY_HIGH: 0, SEVERITY_MEDIUM: 0, SEVERITY_LOW: 0}
-        
-        for issue in sorted_issues:
-            if "issue_id" not in issue or not issue["issue_id"]:
-                severity = issue["severity"]
-                severity_counters[severity] = severity_counters.get(severity, 0) + 1
-                issue["issue_id"] = generate_issue_id(
-                    severity,
-                    iteration,
-                    severity_counters[severity],
-                )
         
         report_lines = [
             "## DocReview Review Report",

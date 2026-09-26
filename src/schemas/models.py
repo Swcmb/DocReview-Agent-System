@@ -106,6 +106,30 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
+SEVERITY_BLOCKING = "Blocking"
+SEVERITY_HIGH = "High"
+SEVERITY_MEDIUM = "Medium"
+SEVERITY_LOW = "Low"
+
+#: 合法 severity 词表。issue 契约校验（§3.3）以此为唯一判据。
+#: 注意 `generate_issue_id()` 对未知 severity 会回退 "UK"——那是纯展示兜底，
+#: 不等于「该 severity 合法」，两者不可混用。
+VALID_SEVERITIES: tuple[str, ...] = (
+    SEVERITY_BLOCKING,
+    SEVERITY_HIGH,
+    SEVERITY_MEDIUM,
+    SEVERITY_LOW,
+)
+
+#: 报告展示顺序（§3.3 步骤 6）。仅影响 Markdown 渲染，不影响 ID 分配顺序。
+SEVERITY_ORDER: dict[str, int] = {
+    SEVERITY_BLOCKING: 0,
+    SEVERITY_HIGH: 1,
+    SEVERITY_MEDIUM: 2,
+    SEVERITY_LOW: 3,
+}
+
+
 def generate_issue_id(severity: str, round_num: int, seq: int) -> str:
     """生成问题唯一标识符
 

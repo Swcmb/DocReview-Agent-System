@@ -30,7 +30,9 @@ import os
 import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, TypedDict, cast
+
+from src.decisions.question_contracts import canonical_json_bytes
 
 __all__ = [
     "LEGAL_MODELS",
@@ -46,6 +48,11 @@ __all__ = [
     "predict_batch",
     "act_allowed",
     "act_refusal_reason",
+    # ---- §11.2 atomic batch（T-12）----
+    "BatchItem",
+    "BatchPlan",
+    "state_chars",
+    "plan_batches",
 ]
 
 #: §7.2 唯一允许出现在 request ``model`` 字段里的逻辑模型名。
@@ -237,3 +244,120 @@ def act_refusal_reason(config: Any) -> str | None:
     if device != "cpu":
         return f"device={device!r} 非 cpu，只能 audit-only"
     return None
+
+
+# ===========================================================================
+# §11.2 确定性 atomic inference batch plan（T-12）
+# ===========================================================================
+class BatchItem(TypedDict):
+    """一个 atomic inference item：已分块 state + 同一 primitive 的完整 question set。"""
+
+    index: int
+    primitive: str
+    question_schema_hash: str
+    model: str | None
+    state: dict[str, Any]
+    questions: list[dict[str, Any]]
+
+
+class BatchPlan(TypedDict):
+    """一批的预算账（§11.2 规则 2）。离线重算必须复现相同边界。"""
+
+    batch_id: str
+    item_indexes: list[int]
+    question_count: int
+    rows: int
+    state_chars: int
+    encoded_chars: int
+
+
+def state_chars(state: Mapping[str, Any]) -> int:
+    """canonical compact state JSON 的 Unicode character 数（§11.2）。
+
+    按**字符**而非字节计数：state 是文本预算，不是网络字节预算。
+    """
+    return len(canonical_json_bytes(dict(state)).decode("utf-8"))
+
+
+def _item_budget(item: BatchItem) -> tuple[int, int, int]:
+    """返回 ``(question_count, state_chars, encoded_chars)``。"""
+    question_count = len(item["questions"])
+    chars = state_chars(item["state"])
+    return question_count, chars, chars * question_count
+
+
+def plan_batches(items: Sequence[BatchItem], config: Any) -> list[BatchPlan]:
+    """按 §11.2 生成确定性 batch plan。
+
+    预算（两条必须**同时**满足）::
+
+        rows         = N * question_count        <= max_batch_rows
+        encoded_chars = sum(state_chars) * qcount <= max_batch_encoded_chars
+
+    ``encoded_chars`` 是**预算估算**，不是事后 tokenizer 测量（§11.2 明示），
+    故离线可复现。单个 item 自身超任一预算即抛 ``LAYA_ERR_BATCH``——不切碎
+    question set、不重试、不进入无限循环（规则 3）。
+    """
+    max_rows = int(getattr(config, "max_batch_rows", 8))
+    max_encoded = int(getattr(config, "max_batch_encoded_chars", 16384))
+
+    for item in items:
+        question_count, chars, encoded = _item_budget(item)
+        if question_count > max_rows:
+            raise AdapterError(
+                "LAYA_ERR_BATCH",
+                f"item {item['index']} 的 question_count {question_count} > max_batch_rows {max_rows}",
+            )
+        if encoded > max_encoded:
+            raise AdapterError(
+                "LAYA_ERR_BATCH",
+                f"item {item['index']} 的 encoded_chars {encoded} > "
+                f"max_batch_encoded_chars {max_encoded}（state_chars={chars}）",
+            )
+
+    # 按 (model, question_schema_hash, primitive) 分组，组内保持输入顺序（规则 1、2）。
+    groups: dict[tuple[str, str, str], list[BatchItem]] = {}
+    for item in items:
+        key = (item["model"] or AUTO, item["question_schema_hash"], item["primitive"])
+        groups.setdefault(key, []).append(item)
+
+    plans: list[BatchPlan] = []
+    for key in groups:
+        group = groups[key]
+        # 同一 schema 即同一 question set，故组内 question_count 恒定；
+        # §11.2 的 sum(state_chars) * question_count 正是按这个恒定值算的。
+        question_count = len(group[0]["questions"])
+        current: list[BatchItem] = []
+        sum_chars = 0
+
+        for item in group:
+            item_chars = state_chars(item["state"])
+            candidate_rows = (len(current) + 1) * question_count
+            candidate_encoded = (sum_chars + item_chars) * question_count
+            if current and (
+                candidate_rows > max_rows or candidate_encoded > max_encoded
+            ):
+                plans.append(_make_plan(len(plans), current, question_count, sum_chars))
+                current, sum_chars = [], 0
+            current.append(item)
+            sum_chars += item_chars
+        if current:
+            plans.append(_make_plan(len(plans), current, question_count, sum_chars))
+    return plans
+
+
+def _make_plan(
+    batch_ordinal: int,
+    batch_items: Sequence[BatchItem],
+    question_count: int,
+    sum_chars: int,
+) -> BatchPlan:
+    """按 §11.2 记 ``rows = N * question_count``、``encoded_chars = sum(state_chars) * question_count``。"""
+    return BatchPlan(
+        batch_id=f"batch-{batch_ordinal:03d}",
+        item_indexes=[item["index"] for item in batch_items],
+        question_count=question_count,
+        rows=len(batch_items) * question_count,
+        state_chars=sum_chars,
+        encoded_chars=sum_chars * question_count,
+    )

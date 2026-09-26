@@ -22,7 +22,7 @@ import logging
 import os
 import shutil
 from datetime import datetime
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Optional
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
@@ -33,6 +33,20 @@ from ..config import AppConfig
 from ..mcp.context7 import Context7Client
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import AgentState
+from ..state.issue_fingerprint import fingerprint_set
+from .review_routing import (
+    has_unresolved_blocking as has_unresolved_blocking,
+)
+from .review_routing import (
+    route_after_approval,
+    route_after_evaluate,
+    route_after_initialize,
+)
+from .review_routing import (
+    route_after_generate_spec as route_after_generate_spec,
+    route_after_load_document as route_after_load_document,
+    route_after_revise_spec as route_after_revise_spec,
+)
 from ..tools.reading import ReadingTool
 from ..tools.terminal import TerminalTool
 from ..tools.web_search import WebSearchTool
@@ -154,23 +168,6 @@ async def initialize(state: AgentState) -> AgentState:
     return state
 
 
-def route_after_initialize(state: AgentState) -> Literal["load_document", "generate_spec"]:
-    """initialize 后的条件路由
-
-    - 若有 document_path 则加载文档
-    - 否则直接生成规格
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        下一节点名称
-    """
-    if state.get("document_path"):
-        return "load_document"
-    return "generate_spec"
-
-
 async def load_document(state: AgentState) -> AgentState:
     """加载文档内容
 
@@ -263,36 +260,6 @@ async def evaluate_result(state: AgentState) -> AgentState:
     return state
 
 
-def route_after_evaluate(state: AgentState) -> Literal["user_approval", "revise_spec", "finalize"]:
-    """evaluate_result 后的条件路由
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        下一节点名称
-    """
-    conclusion = state.get("review_conclusion", "Fail")
-    iteration_count = state.get("iteration_count", 0)
-    max_iterations = state.get("max_iterations", 10)
-    stagnation_count = state.get("stagnation_count", 0)
-    stagnation_threshold = state.get("stagnation_threshold", 2)
-
-    if iteration_count >= max_iterations:
-        logger.info("达到最大迭代次数，强制终止")
-        return "finalize"
-
-    if stagnation_count >= stagnation_threshold:
-        logger.info("检测到停滞，强制终止")
-        return "finalize"
-
-    if conclusion in ("Pass", "Conditional Pass"):
-        state["awaiting_approval"] = True
-        return "user_approval"
-
-    return "revise_spec"
-
-
 def user_approval(state: AgentState) -> AgentState:
     """用户确认节点（中断点）
 
@@ -306,30 +273,6 @@ def user_approval(state: AgentState) -> AgentState:
     """
     logger.info("等待用户确认")
     return state
-
-
-def route_after_approval(state: AgentState) -> Literal["execute", "revise_spec", "finalize"]:
-    """user_approval 后的条件路由
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        下一节点名称
-    """
-    if state.get("approval_timed_out"):
-        state["error_code"] = "DOCREVIEW_ERR_LOOP_003"
-        return "finalize"
-
-    if state.get("user_approved"):
-        return "execute"
-
-    conclusion = state.get("review_conclusion", "")
-
-    if conclusion == "Conditional Pass":
-        return "revise_spec"
-
-    return "finalize"
 
 
 async def execute(state: AgentState) -> AgentState:
@@ -373,33 +316,12 @@ async def finalize(state: AgentState) -> AgentState:
     return state
 
 
-def _issue_fingerprint(issue: dict) -> tuple:
-    """问题的内容身份：severity + issue_type + 规范化 description 哈希
-
-    issue_id 内嵌轮次号，跨轮必然不同，不能用作停滞比较的身份。
-    description 规范化（去空白、去标点、转小写）后哈希，
-    使同义改写仍被视为同一问题。
-
-    Args:
-        issue: 单条审查问题
-
-    Returns:
-        可比较的元组身份
-    """
-    import hashlib
-    import re
-
-    raw = issue.get("description", "")
-    normalized = re.sub(r"[\s\W_]+", "", raw, flags=re.UNICODE).lower()
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return (issue.get("severity", ""), issue.get("issue_type", ""), digest)
-
-
 def _is_stagnant(state: AgentState) -> bool:
     """检测审查问题列表是否停滞（连续两轮无变化）
 
-    通过比较最近两轮问题的内容身份集合来判断是否停滞
-    （severity + issue_type + 规范化 description 哈希）。
+    通过比较最近两轮问题的内容身份集合来判断是否停滞。指纹由
+    `src/state/issue_fingerprint.py` 唯一定义（§3.3／§10.4）——本模块
+    不再内联计算，避免两套语义漂移。
 
     Args:
         state: 当前工作流状态
@@ -411,8 +333,8 @@ def _is_stagnant(state: AgentState) -> bool:
     if len(reports) < 2:
         return False
 
-    this_issues = {_issue_fingerprint(i) for i in reports[-1].get("issues", [])}
-    prev_issues = {_issue_fingerprint(i) for i in reports[-2].get("issues", [])}
+    this_issues = fingerprint_set(reports[-1].get("issues", []))
+    prev_issues = fingerprint_set(reports[-2].get("issues", []))
 
     return this_issues == prev_issues
 

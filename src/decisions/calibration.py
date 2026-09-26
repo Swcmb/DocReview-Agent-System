@@ -4,14 +4,17 @@
 ``sample_id`` **精确**一一 join，然后逐字段比较 identity。**任何** join 缺陷都
 必须立即失败——不得按最近邻、时间或文本相似度补 join（§9.1）。
 
-本模块只做「读 + 校验 + join」。阈值拟合、指标、ECE 属 T-10 的
-``scripts/calibrate_laya.py``。
+本模块承担「读 + 校验 + join + 指标 + fit-only 阈值选择」。CLI 驱动是
+``scripts/calibrate_laya.py``（§9.5），它只做参数解析与落盘，逻辑全在此处，
+以便指标与阈值口径可被测试直接覆盖。
 
 设计要点：
 - **受控样本库根由调用方显式传入**，不从配置猜、不从 ``state_ref`` 推导。
   自己声明「什么是受控」等于没有受控边界。
 - 全部失败路径收敛到一个 ``CalibrationError``，带稳定 ``code``；上层脚本据此
   映射退出码，本模块不自行 ``sys.exit``。
+- **阈值只在 fit join 上选**（§9.4）。validation join 只算最终指标，任何让它
+  参与候选排序的代码路径都是规格违规。
 """
 
 from __future__ import annotations
@@ -20,25 +23,63 @@ import hashlib
 import json
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
 
-from src.decisions.question_contracts import FROZEN_BUSINESS_QUESTIONS
+from src.decisions.question_contracts import FROZEN_BUSINESS_QUESTIONS, canonical_json_bytes
 
 __all__ = [
+    # ---- 错误与 schema ----
     "CalibrationError",
     "CalibrationErrorCode",
+    "FAILING_CODES",
+    "SCHEMA_VERSION",
+    "IDENTITY_FIELDS",
+    # ---- §9.4 指标常量 ----
+    "POS_GRID",
+    "NEG_GRID",
+    "MARGIN_GRID",
+    "MIN_COVERAGE",
+    "MIN_ACCURACY",
+    "MAX_ECE",
+    "MIN_FIT_JOIN",
+    "MIN_VALIDATION_JOIN",
+    "MIN_NOUL_PER_CLASS_VALIDATION",
+    "MIN_LEVEL_PER_CLASS_VALIDATION",
+    "ECE_BINS",
+    "ECE_DECIMALS",
+    # ---- 类型 ----
     "LabelSample",
     "InferenceSample",
     "JoinedSample",
+    "Thresholds",
+    "ClassMetrics",
+    "EceBin",
+    "Metrics",
+    "EvalSample",
+    "JoinSummary",
+    # ---- §9.1 join ----
     "source_doc_dedup_key",
     "file_sha256",
+    "canonical_digest",
     "parse_label",
     "parse_inference",
     "read_jsonl",
     "validate_human_label",
     "join_samples",
     "load_and_join",
+    "summary_of",
+    # ---- §9.4 指标与阈值 ----
+    "threshold_grid",
+    "question_classes",
+    "build_eval_samples",
+    "expected_calibration_error",
+    "per_class_metrics",
+    "compute_metrics",
+    "select_thresholds",
+    "validate_split_sizing",
+    # ---- CLI ----
     "main",
 ]
 
@@ -75,6 +116,10 @@ CalibrationErrorCode = Literal[
     "missing_field",
     "human_label_type_mismatch",
     "artifact_unreadable",
+    "no_valid_threshold",
+    "split_too_small",
+    "split_document_leak",
+    "class_sample_insufficient",
 ]
 
 #: 需要非零退出码的 code 全集。测试据此断言「失败即非零」，不逐个写 exit 1。
@@ -97,6 +142,10 @@ FAILING_CODES: Final[frozenset[str]] = frozenset(
         "missing_field",
         "human_label_type_mismatch",
         "artifact_unreadable",
+        "no_valid_threshold",
+        "split_too_small",
+        "split_document_leak",
+        "class_sample_insufficient",
     }
 )
 
@@ -203,6 +252,60 @@ def file_sha256(path: Path) -> str:
     刻意**不**做任何换行/编码规范化：``state_ref.sha256`` 钉的是文件真实字节。
     """
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_digest(value: object) -> str:
+    """canonical JSON 的 SHA-256，带 ``sha256:`` 前缀（§9.2／§9.3）。
+
+    复用 question_contracts 的统一 canonical 序列化（sort_keys + 紧凑分隔符 +
+    保留非 ASCII），保证 join 摘要、manifest 摘要与 question hash 三者口径一致。
+    """
+    return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+class JoinSummary(TypedDict):
+    """split 规模摘要（§9.3 的 ``fit_join`` / ``validation_join``）。"""
+
+    sample_count: int
+    source_doc_key_count: int
+    class_counts: dict[str, int]
+    join_sha256: str
+
+
+def summary_of(joined: Sequence[Mapping[str, Any]]) -> JoinSummary:
+    """把已 join 样本压成 §9.3 要求的 split 摘要。
+
+    ``join_sha256`` 由**按 sample_id 排序后的** label+inference 投影算出，故与
+    artifact 的行序无关：重排 JSONL 不应改变摘要。投影里保留 identity 九字段、
+    ``state_digest``、``human_label`` 与 ``raw_answer``/``probabilities``——
+    任何影响判定的输入变动都必须改变摘要。
+    """
+    projection = []
+    class_counts: dict[str, int] = {}
+    for item in sorted(joined, key=lambda entry: str(entry["label"]["sample_id"])):
+        label = item["label"]
+        inference = item["inference"]
+        primitive = str(label["primitive"])
+        question_id = str(label["question_id"])
+        question_type = str(FROZEN_BUSINESS_QUESTIONS[primitive][question_id]["type"])
+        name = _class_name(question_type, label.get("human_label"))
+        if name is not None:
+            class_counts[name] = class_counts.get(name, 0) + 1
+        projection.append(
+            {
+                "sample_id": str(label["sample_id"]),
+                "identity": {field: label[field] for field in IDENTITY_FIELDS},
+                "human_label": label.get("human_label"),
+                "raw_answer": inference.get("raw_answer"),
+                "probabilities": inference.get("probabilities"),
+            }
+        )
+    return JoinSummary(
+        sample_count=len(joined),
+        source_doc_key_count=len({str(item["label"]["source_doc_dedup_key"]) for item in joined}),
+        class_counts=dict(sorted(class_counts.items())),
+        join_sha256=canonical_digest(projection),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -514,3 +617,446 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     print(f"OK joined={len(joined)}")
     return 0
+
+
+# ===========================================================================
+# §9.4 指标与确定性阈值选择
+# ===========================================================================
+# 阈值网格（§9.4 固定，不得改为连续搜索）
+POS_GRID: Final[tuple[float, ...]] = tuple(round(0.50 + 0.05 * i, 2) for i in range(10))
+NEG_GRID: Final[tuple[float, ...]] = tuple(round(0.05 + 0.05 * i, 2) for i in range(9))
+MARGIN_GRID: Final[tuple[float, ...]] = tuple(round(0.05 + 0.05 * i, 2) for i in range(10))
+
+#: fit 阶段的候选门槛（§9.4）
+MIN_COVERAGE: Final = 0.60
+MIN_ACCURACY: Final = 0.80
+MAX_ECE: Final = 0.10
+
+#: split 规模与类别最小样本（§9.4）
+MIN_FIT_JOIN: Final = 100
+MIN_VALIDATION_JOIN: Final = 50
+MIN_NOUL_PER_CLASS_VALIDATION: Final = 25
+MIN_LEVEL_PER_CLASS_VALIDATION: Final = 20
+
+ECE_BINS: Final = 10
+ECE_DECIMALS: Final = 6
+
+
+class Thresholds(TypedDict):
+    pos: float
+    neg: float
+    margin: float
+
+
+class ClassMetrics(TypedDict):
+    precision: float
+    recall: float
+    f1: float
+    support: int
+
+
+class EceBin(TypedDict):
+    count: int
+    mean_confidence: float | None
+    accuracy: float | None
+
+
+class Metrics(TypedDict):
+    """``compute_metrics`` 恒定返回的全部字段——故全部为必填。"""
+
+    sample_count: int
+    decided_count: int
+    coverage: float
+    accuracy: float
+    ece: float
+    ece_bins: list[EceBin]
+    per_class: dict[str, ClassMetrics]
+    score_potential_coverage: float
+
+
+class EvalSample(TypedDict):
+    """单个已 join 样本的评估视图（把 label/inference 压成指标所需的最少字段）。"""
+
+    sample_id: str
+    question_type: str
+    human_label: str
+    status: str
+    predicted: str | None
+    confidence: float | None
+    potential_decided: bool
+
+
+def threshold_grid() -> list[Thresholds]:
+    """固定阈值网格：``pos × neg × margin``，只保留 ``neg < pos``（§9.4）。"""
+    return [
+        Thresholds(pos=pos, neg=neg, margin=margin)
+        for pos in POS_GRID
+        for neg in NEG_GRID
+        for margin in MARGIN_GRID
+        if neg < pos
+    ]
+
+
+def question_classes(primitive: str, question_id: str) -> list[str]:
+    """该 question 的全部类别名。
+
+    noul → ``["false","true"]``；choice → criteria 声明顺序的键；score → ``"0".."n-1"``。
+    §9.4 要求 choice 每个 criteria、score 每个档位都必须出现在 per-class 里。
+    """
+    question = FROZEN_BUSINESS_QUESTIONS[primitive][question_id]
+    qtype = question["type"]
+    if qtype == "noul":
+        return ["false", "true"]
+    if qtype == "choice":
+        criteria = question["criteria"]
+        assert isinstance(criteria, dict)
+        return list(criteria)
+    levels = question["criteria"]
+    assert isinstance(levels, list)
+    return [str(index) for index in range(len(levels))]
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _class_name(question_type: str, label: object) -> str | None:
+    if question_type == "noul":
+        return "true" if label is True else ("false" if label is False else None)
+    if question_type == "choice":
+        return label if isinstance(label, str) else None
+    if isinstance(label, bool) or not isinstance(label, int):
+        return None
+    return str(label)
+
+
+def _decide(
+    primitive: str,
+    question_id: str,
+    label: Mapping[str, Any],
+    inference: Mapping[str, Any],
+    thresholds: Thresholds,
+) -> tuple[str, str | None, float | None, bool]:
+    """按 §4.1 三态规则判定单样本。
+
+    返回 ``(status, predicted_class, confidence, potential_decided)``。
+
+    **F2 纪律（§8.2）**：``noul`` 判据**只能**读原生字段
+    ``raw_answer["noul"]`` 与 ``raw_answer["answer_confidence"]``。
+    ``probabilities["noul"]`` 是 ``structured.py`` 用 ``{false:1-p,true:p}``
+    现场合成的，不是模型输出；``answer_confidence`` 也不能用
+    ``DecisionResult.confidence`` 替代（那是未校准的归一化熵）。
+    choice/score 的 ``probabilities`` 才是模型输出，可以读。
+    """
+    question = FROZEN_BUSINESS_QUESTIONS[primitive][question_id]
+    qtype = str(question["type"])
+    raw = inference.get("raw_answer")
+    if not isinstance(raw, dict):
+        return "uncertain", None, None, False
+    confidence = _finite(raw.get("answer_confidence"))
+    pos = thresholds["pos"]
+    neg = thresholds["neg"]
+
+    if qtype == "noul":
+        p_true = _finite(raw.get("noul"))
+        if p_true is None or confidence is None:
+            return "uncertain", None, confidence, False
+        if p_true >= pos and confidence >= pos:
+            return "act", "true", confidence, True
+        if p_true <= neg and confidence >= pos:
+            return "pass", "false", confidence, True
+        return "uncertain", None, confidence, False
+
+    if qtype == "choice":
+        criteria = question["criteria"]
+        assert isinstance(criteria, dict)
+        probabilities = inference.get("probabilities")
+        if len(criteria) < 2 or not isinstance(probabilities, dict) or confidence is None:
+            return "uncertain", None, confidence, False
+        known = {
+            str(key): value
+            for key, value in ((k, _finite(v)) for k, v in probabilities.items())
+            if key in criteria and value is not None
+        }
+        if len(known) < 2:
+            return "uncertain", None, confidence, False
+        ranked = sorted(known.items(), key=lambda item: item[1], reverse=True)
+        top_key, top_value = ranked[0]
+        second_value = ranked[1][1]
+        if confidence >= pos and (top_value - second_value) >= thresholds["margin"]:
+            return "act", top_key, confidence, True
+        return "uncertain", None, confidence, False
+
+    # score：永远 uncertain，route_action=no_action（§4.1）。potential_decided 只用于
+    # 离线 score_potential_coverage，运行时永不转成业务动作。
+    #
+    # 注意 score 概率的键是**档位下标字符串**，不是 criteria 描述文本：Laya 取 argmax
+    # 用 `probs.get(str(i), probs.get(i, 0.0))`（`structured.py:185`），且它自己构造的
+    # score criteria 也是 `[str(v) for v in range(lo, hi+1)]`（`structured.py:116`）。
+    # 本项目的冻结契约把 score criteria 写成描述性标签（§5.2），两者**不是同一套键**，
+    # 故这里必须按 `range(len(levels))` 生成合法下标集——若误拿描述文本去匹配，
+    # 合法概率会被全部判为未知，score_potential_coverage 恒为 0 且不抛异常。
+    probabilities = inference.get("probabilities")
+    levels = question["criteria"]
+    assert isinstance(levels, list)
+    valid_level_keys = {str(index) for index in range(len(levels))}
+    potential = False
+    if isinstance(probabilities, dict) and confidence is not None and confidence >= pos:
+        potential = any(
+            _finite(value) is not None
+            for key, value in probabilities.items()
+            if str(key) in valid_level_keys
+        )
+    return "uncertain", None, confidence, potential
+
+
+def build_eval_samples(
+    joined: Sequence[Mapping[str, Any]], thresholds: Thresholds
+) -> list[EvalSample]:
+    """把已 join 样本压成评估视图。"""
+    samples: list[EvalSample] = []
+    for item in joined:
+        label = item["label"]
+        inference = item["inference"]
+        primitive = str(label["primitive"])
+        question_id = str(label["question_id"])
+        question_type = str(FROZEN_BUSINESS_QUESTIONS[primitive][question_id]["type"])
+        human = _class_name(question_type, label.get("human_label"))
+        status, predicted, confidence, potential = _decide(
+            primitive, question_id, label, inference, thresholds
+        )
+        samples.append(
+            EvalSample(
+                sample_id=str(label["sample_id"]),
+                question_type=question_type,
+                human_label=human if human is not None else "",
+                status=status,
+                predicted=predicted,
+                confidence=confidence,
+                potential_decided=potential,
+            )
+        )
+    return samples
+
+
+def expected_calibration_error(samples: Sequence[EvalSample]) -> tuple[float, list[EceBin]]:
+    """10-bin ECE（§9.4）。
+
+    边界固定为 ``[0.0,0.1), [0.1,0.2), ... [0.9,1.0]``——最后一个 bin **闭于 1.0**。
+    每个 bin 记录 count / mean confidence / accuracy；空 bin 不参与平均；
+    返回值保留 6 位小数。
+
+    bin 索引用 ``Decimal`` 而非直接 ``int(conf*10)``：二进制浮点下
+    ``0.3*10 == 2.9999999999999996``，会把恰好落在 ``0.3`` 的置信度错分到
+    ``[0.2,0.3)``。规格把「ECE 边界」列为验收项，故此处必须精确。
+    """
+    usable = [
+        sample
+        for sample in samples
+        if sample["predicted"] is not None and sample["confidence"] is not None
+    ]
+    buckets: list[list[EvalSample]] = [[] for _ in range(ECE_BINS)]
+    for sample in usable:
+        confidence = Decimal(str(sample["confidence"]))
+        index = int(confidence * ECE_BINS)
+        if index >= ECE_BINS:  # 1.0 落最后 bin
+            index = ECE_BINS - 1
+        buckets[index].append(sample)
+
+    total = len(usable)
+    bins: list[EceBin] = []
+    ece = 0.0
+    for bucket in buckets:
+        count = len(bucket)
+        if count == 0:
+            bins.append(EceBin(count=0, mean_confidence=None, accuracy=None))
+            continue
+        mean_confidence = sum(float(s["confidence"]) for s in bucket) / count  # type: ignore[arg-type]
+        accuracy = sum(1 for s in bucket if s["predicted"] == s["human_label"]) / count
+        ece += (count / total) * abs(mean_confidence - accuracy)
+        bins.append(
+            EceBin(
+                count=count,
+                mean_confidence=round(mean_confidence, ECE_DECIMALS),
+                accuracy=round(accuracy, ECE_DECIMALS),
+            )
+        )
+    return round(ece, ECE_DECIMALS), bins
+
+
+def per_class_metrics(
+    samples: Sequence[EvalSample], classes: Sequence[str]
+) -> dict[str, ClassMetrics]:
+    """one-vs-rest 的 precision / recall / F1 / support（§9.4）。
+
+    分母为零时该指标记 0，但 **support 仍按全部样本统计**（含未决定样本）——
+    否则「一个都没决定」的类别会显示成不存在，掩盖覆盖率问题。
+    """
+    decided = [sample for sample in samples if sample["predicted"] is not None]
+    result: dict[str, ClassMetrics] = {}
+    for name in classes:
+        true_positive = sum(
+            1 for s in decided if s["predicted"] == name and s["human_label"] == name
+        )
+        false_positive = sum(
+            1 for s in decided if s["predicted"] == name and s["human_label"] != name
+        )
+        false_negative = sum(
+            1 for s in decided if s["predicted"] != name and s["human_label"] == name
+        )
+        precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 0.0
+        recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        support = sum(1 for s in samples if s["human_label"] == name)
+        result[name] = ClassMetrics(
+            precision=round(precision, ECE_DECIMALS),
+            recall=round(recall, ECE_DECIMALS),
+            f1=round(f1, ECE_DECIMALS),
+            support=support,
+        )
+    return result
+
+
+def compute_metrics(
+    joined: Sequence[Mapping[str, Any]], thresholds: Thresholds
+) -> Metrics:
+    """在给定阈值下算全套指标（§9.4）。``joined`` 决定 fit 还是 validation 语义。"""
+    samples = build_eval_samples(joined, thresholds)
+    decided = [sample for sample in samples if sample["status"] in ("act", "pass")]
+    total = len(samples)
+    coverage = (len(decided) / total) if total else 0.0
+    correct = sum(1 for sample in decided if sample["predicted"] == sample["human_label"])
+    accuracy = (correct / len(decided)) if decided else 0.0
+    ece, bins = expected_calibration_error(samples)
+
+    classes: list[str] = []
+    for item in joined:
+        primitive = str(item["label"]["primitive"])
+        question_id = str(item["label"]["question_id"])
+        for name in question_classes(primitive, question_id):
+            if name not in classes:
+                classes.append(name)
+
+    score_samples = [s for s in samples if s["question_type"] == "score"]
+    potential = (
+        sum(1 for s in score_samples if s["potential_decided"]) / len(score_samples)
+        if score_samples
+        else 0.0
+    )
+
+    return Metrics(
+        sample_count=total,
+        decided_count=len(decided),
+        coverage=round(coverage, ECE_DECIMALS),
+        accuracy=round(accuracy, ECE_DECIMALS),
+        ece=ece,
+        ece_bins=bins,
+        per_class=per_class_metrics(samples, classes),
+        score_potential_coverage=round(potential, ECE_DECIMALS),
+    )
+
+
+def _meets_fit_support(metrics: Metrics) -> bool:
+    """fit 候选必须让**每个**类别都有样本，否则该类别无从校准。"""
+    return bool(metrics["per_class"]) and all(
+        entry["support"] >= 1 for entry in metrics["per_class"].values()
+    )
+
+
+def select_thresholds(
+    fit_joined: Sequence[Mapping[str, Any]],
+) -> tuple[Thresholds, Metrics]:
+    """**只在 fit join 上**选阈值（§9.4）。
+
+    过滤 ``coverage>=0.60``、``accuracy>=0.80``、每类 support>=1、``ece<=0.10``；
+    按 ``(coverage 降, accuracy 降, ECE 升, (pos-neg) 升, margin 升, pos 升, neg 升)``
+    取第一项。函数签名里**没有** validation 参数——这是「validation 不可调阈值」
+    的结构性保证，而非靠调用方自觉。
+    """
+    candidates: list[tuple[Metrics, Thresholds]] = []
+    for thresholds in threshold_grid():
+        metrics = compute_metrics(fit_joined, thresholds)
+        if metrics["coverage"] < MIN_COVERAGE:
+            continue
+        if metrics["accuracy"] < MIN_ACCURACY:
+            continue
+        if metrics["ece"] > MAX_ECE:
+            continue
+        if not _meets_fit_support(metrics):
+            continue
+        candidates.append((metrics, thresholds))
+    if not candidates:
+        raise CalibrationError(
+            "no_valid_threshold", "fit join 上没有任何阈值组合满足 coverage/accuracy/ECE/support 门槛"
+        )
+    candidates.sort(
+        key=lambda pair: (
+            -pair[0]["coverage"],
+            -pair[0]["accuracy"],
+            pair[0]["ece"],
+            pair[1]["pos"] - pair[1]["neg"],
+            pair[1]["margin"],
+            pair[1]["pos"],
+            pair[1]["neg"],
+        )
+    )
+    best_metrics, best_thresholds = candidates[0]
+    return best_thresholds, best_metrics
+
+
+def validate_split_sizing(
+    fit_joined: Sequence[Mapping[str, Any]], validation_joined: Sequence[Mapping[str, Any]]
+) -> None:
+    """split 规模、类别最小样本与文档 key 交集（§9.4）。
+
+    交集非空即 invalid：同一原始文档的片段跨 fit/validation 会让 validation 指标
+    失去意义（等于在训练集上测）。
+    """
+    if len(fit_joined) < MIN_FIT_JOIN:
+        raise CalibrationError("split_too_small", f"fit join {len(fit_joined)} < {MIN_FIT_JOIN}")
+    if len(validation_joined) < MIN_VALIDATION_JOIN:
+        raise CalibrationError(
+            "split_too_small", f"validation join {len(validation_joined)} < {MIN_VALIDATION_JOIN}"
+        )
+
+    fit_keys = {str(item["label"]["source_doc_dedup_key"]) for item in fit_joined}
+    validation_keys = {str(item["label"]["source_doc_dedup_key"]) for item in validation_joined}
+    overlap = sorted(fit_keys & validation_keys)
+    if overlap:
+        raise CalibrationError(
+            "split_document_leak",
+            f"fit/validation 原始文档 key 交集非空（{len(overlap)} 个），存在数据泄漏",
+        )
+
+    counts: dict[tuple[str, str, str], int] = {}
+    for item in validation_joined:
+        label = item["label"]
+        primitive = str(label["primitive"])
+        question_id = str(label["question_id"])
+        question_type = str(FROZEN_BUSINESS_QUESTIONS[primitive][question_id]["type"])
+        name = _class_name(question_type, label.get("human_label")) or ""
+        key = (primitive, question_id, name)
+        counts[key] = counts.get(key, 0) + 1
+
+    for item in validation_joined:
+        label = item["label"]
+        primitive = str(label["primitive"])
+        question_id = str(label["question_id"])
+        question_type = str(FROZEN_BUSINESS_QUESTIONS[primitive][question_id]["type"])
+        for name in question_classes(primitive, question_id):
+            minimum = (
+                MIN_NOUL_PER_CLASS_VALIDATION
+                if question_type == "noul"
+                else MIN_LEVEL_PER_CLASS_VALIDATION
+            )
+            if counts.get((primitive, question_id, name), 0) < minimum:
+                raise CalibrationError(
+                    "class_sample_insufficient",
+                    f"validation {primitive}.{question_id} 的 {name!r} 类样本 "
+                    f"{counts.get((primitive, question_id, name), 0)} < {minimum}",
+                )

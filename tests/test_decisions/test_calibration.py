@@ -17,19 +17,34 @@ from typing import Any, get_args
 import pytest
 
 from src.decisions.calibration import (
+    ECE_BINS,
+    ECE_DECIMALS,
     FAILING_CODES,
     IDENTITY_FIELDS,
+    MARGIN_GRID,
+    NEG_GRID,
+    POS_GRID,
     CalibrationError,
     CalibrationErrorCode,
+    EvalSample,
+    Thresholds,
+    compute_metrics,
+    expected_calibration_error,
     file_sha256,
     load_and_join,
     main,
     parse_inference,
     parse_label,
+    per_class_metrics,
+    question_classes,
     read_jsonl,
+    select_thresholds,
     source_doc_dedup_key,
+    threshold_grid,
     validate_human_label,
+    validate_split_sizing,
 )
+from src.decisions.question_contracts import FROZEN_BUSINESS_QUESTIONS
 
 FIXTURES = Path(__file__).parent / "fixtures" / "calibration"
 CANONICAL_LABELS = FIXTURES / "labels.jsonl"
@@ -412,3 +427,344 @@ def test_declared_error_codes_match_failing_codes():
     或某个失败路径没登记（非零退出契约漏网）。本轮就因此清掉了 ``join_missing_pair``。
     """
     assert set(get_args(CalibrationErrorCode)) == set(FAILING_CODES)
+
+
+# ===========================================================================
+# T-10：§9.4 指标、10-bin ECE、per-class golden、fit-only 阈值选择
+# ===========================================================================
+def _noul_joined(
+    index: int, p_true: float, confidence: float, human_label: bool, dedup: str | None = None
+) -> dict[str, Any]:
+    """构造一个 ``verify_issues.grounded``（noul）的已 join 样本。
+
+    刻意只填指标层读取的字段，避免测试依赖 join 全字段。
+    """
+    sample_id = f"grounded-{index:06d}"
+    return {
+        "sample_id": sample_id,
+        "label": {
+            "sample_id": sample_id,
+            "primitive": "verify_issues",
+            "question_id": "grounded",
+            "human_label": human_label,
+            "source_doc_dedup_key": dedup or f"sha256:doc{index:064d}"[:71],
+        },
+        "inference": {
+            "sample_id": sample_id,
+            # F2：noul 判据只读 raw_answer 的原生字段
+            "raw_answer": {"type": "noul", "noul": p_true, "answer_confidence": confidence},
+            "probabilities": {"true": p_true, "false": 1.0 - p_true},
+        },
+    }
+
+
+def _eval(
+    confidence: float, predicted: str | None, human_label: str, question_type: str = "noul"
+) -> Any:
+    return EvalSample(
+        sample_id="s",
+        question_type=question_type,
+        human_label=human_label,
+        status="act" if predicted is not None else "uncertain",
+        predicted=predicted,
+        confidence=confidence,
+        potential_decided=predicted is not None,
+    )
+
+
+# --- 阈值网格（§9.4 固定）-------------------------------------------------
+def test_threshold_grid_shape_and_neg_lt_pos():
+    grid = threshold_grid()
+    assert len(grid) == 900  # 10 pos × 9 neg × 10 margin
+    assert all(item["neg"] < item["pos"] for item in grid)
+    assert POS_GRID[0] == 0.50 and POS_GRID[-1] == 0.95
+    assert NEG_GRID[0] == 0.05 and NEG_GRID[-1] == 0.45
+    assert MARGIN_GRID[0] == 0.05 and MARGIN_GRID[-1] == 0.50
+
+
+# --- ECE 边界 golden（§9.4：验收项）--------------------------------------
+@pytest.mark.parametrize(
+    ("confidence", "expected_bin"),
+    [
+        (0.0, 0),
+        (0.05, 0),
+        (0.1, 1),
+        (0.29999, 2),
+        (0.3, 3),  # 关键：二进制浮点下 0.3*10 会落到 2，必须精确进 bin 3
+        (0.55, 5),
+        (0.89999, 8),
+        (0.9, 9),
+        (0.95, 9),
+        (1.0, 9),  # 1.0 闭于最后 bin
+    ],
+)
+def test_ece_bin_boundaries(confidence, expected_bin):
+    _, bins = expected_calibration_error([_eval(confidence, "true", "true")])
+    occupied = [index for index, entry in enumerate(bins) if entry["count"] > 0]
+    assert occupied == [expected_bin], f"conf={confidence} 应落 bin {expected_bin}，实得 {occupied}"
+
+
+def test_ece_perfect_calibration_is_zero():
+    """conf=1.0 且全对 → mean_conf==accuracy==1.0 → ECE 0。"""
+    ece, bins = expected_calibration_error([_eval(1.0, "true", "true")])
+    assert ece == 0.0
+    assert bins[9] == {"count": 1, "mean_confidence": 1.0, "accuracy": 1.0}
+
+
+def test_ece_confidently_wrong_is_one():
+    """conf=1.0 且全错 → ECE 1.0。"""
+    ece, _ = expected_calibration_error([_eval(1.0, "true", "false")])
+    assert ece == 1.0
+
+
+def test_ece_two_bins_weighted_golden():
+    """两个样本分处 bin 0 / bin 9，各对各错一个：
+    0.5*|0.05-1.0| + 0.5*|0.95-0.0| = 0.475 + 0.475 = 0.95。"""
+    samples = [_eval(0.05, "true", "true"), _eval(0.95, "true", "false")]
+    ece, bins = expected_calibration_error(samples)
+    assert bins[0] == {"count": 1, "mean_confidence": 0.05, "accuracy": 1.0}
+    assert bins[9] == {"count": 1, "mean_confidence": 0.95, "accuracy": 0.0}
+    assert ece == 0.95
+
+
+def test_ece_empty_bins_excluded_and_reported():
+    """空 bin 必须出现在 bins 里（count=0）但不参与加权平均。"""
+    ece, bins = expected_calibration_error([_eval(1.0, "true", "true")])
+    assert len(bins) == ECE_BINS
+    assert sum(1 for entry in bins if entry["count"] == 0) == ECE_BINS - 1
+    assert ece == 0.0  # 空 bin 若参与平均会得到 0.0/10 之类的假低值
+
+
+def test_ece_rounded_to_six_decimals():
+    samples = [_eval(0.07, "true", "true"), _eval(0.93, "true", "false")]
+    ece, _ = expected_calibration_error(samples)
+    assert ece == round(ece, ECE_DECIMALS)
+    assert len(str(ece).split(".")[-1]) <= ECE_DECIMALS
+
+
+# --- per-class golden（one-vs-rest）---------------------------------------
+def test_per_class_metrics_golden():
+    """4 个已决定样本：TP=2 / FP=1 / FN=1（针对 "true" 类）。
+    precision=2/3, recall=2/3, f1=2/3。"""
+    samples = [
+        _eval(0.9, "true", "true"),  # TP
+        _eval(0.9, "true", "true"),  # TP
+        _eval(0.9, "true", "false"),  # FP（误报 true）
+        _eval(0.9, "false", "true"),  # FN（漏报 true）
+    ]
+    result = per_class_metrics(samples, ["false", "true"])
+    assert result["true"] == {
+        "precision": round(2 / 3, 6),
+        "recall": round(2 / 3, 6),
+        "f1": round(2 / 3, 6),
+        "support": 3,
+    }
+    # "false" 类：唯一标注为 false 的样本被预测成 true → FN；另有一个被预测成 false
+    # 但标注为 true → FP。故 TP=0，precision/recall/F1 全为 0，support 仍为 1。
+    assert result["false"] == {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 1,
+    }
+
+
+def test_per_class_zero_denominator_records_zero_but_keeps_support():
+    """分母为零记 0，但 support 仍保留——否则「一个都没决定」会显示成类不存在。"""
+    samples = [_eval(0.9, "true", "true")]
+    result = per_class_metrics(samples, ["false", "true"])
+    assert result["false"] == {"precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0}
+    assert result["true"]["support"] == 1
+
+
+def test_per_class_support_counts_undecided_samples():
+    samples = [_eval(0.9, "true", "true"), _eval(0.1, None, "false")]
+    result = per_class_metrics(samples, ["false", "true"])
+    assert result["false"]["support"] == 1  # 未决定也算 support
+
+
+def test_question_classes_cover_every_choice_key_and_score_level():
+    assert question_classes("verify_issues", "grounded") == ["false", "true"]
+    assert question_classes("assess", "document_type") == [
+        "prd", "technical_plan", "implementation_plan", "acceptance_checklist", "non_technical",
+    ]
+    assert question_classes("assess", "completeness") == ["0", "1", "2", "3", "4"]
+
+
+# --- coverage / accuracy / score_potential_coverage -----------------------
+def test_coverage_and_accuracy_golden():
+    """4 个 noul 样本：2 个决定且正确、1 个决定但错、1 个未决定。
+    coverage=3/4=0.75，accuracy=2/3。"""
+    joined = [
+        _noul_joined(0, 0.95, 0.95, True),
+        _noul_joined(1, 0.05, 0.95, False),
+        _noul_joined(2, 0.95, 0.95, False),  # 决定但错
+        _noul_joined(3, 0.50, 0.10, True),  # conf < pos → uncertain
+    ]
+    metrics = compute_metrics(joined, Thresholds(pos=0.75, neg=0.25, margin=0.20))
+    assert metrics["sample_count"] == 4
+    assert metrics["decided_count"] == 3
+    assert metrics["coverage"] == 0.75
+    assert metrics["accuracy"] == round(2 / 3, 6)
+
+
+def test_score_is_always_uncertain_and_reports_potential_only():
+    """score 永远 uncertain；potential 只作离线诊断，不进业务动作。"""
+    joined = [
+        {
+            "sample_id": f"imp-{i:06d}",
+            "label": {
+                "sample_id": f"imp-{i:06d}",
+                "primitive": "assess",
+                "question_id": "completeness",
+                "human_label": 4,
+                "source_doc_dedup_key": f"sha256:doc{i:064d}"[:71],
+            },
+            "inference": {
+                "sample_id": f"imp-{i:06d}",
+                "raw_answer": {"type": "score", "answer_confidence": 0.9},
+                "probabilities": {"0": 0.02, "1": 0.03, "2": 0.05, "3": 0.2, "4": 0.7},
+            },
+        }
+        for i in range(4)
+    ]
+    metrics = compute_metrics(joined, Thresholds(pos=0.75, neg=0.25, margin=0.20))
+    assert metrics["decided_count"] == 0
+    assert metrics["coverage"] == 0.0
+    assert metrics["score_potential_coverage"] == 1.0
+    assert set(metrics["per_class"]) == {"0", "1", "2", "3", "4"}
+
+
+def test_f2_noul_reads_native_fields_not_probabilities():
+    """F2 回归：noul 判据只读 raw_answer 原生字段。
+
+    这里把 ``probabilities`` 置为与 ``noul`` 矛盾的值，若实现误读 probabilities
+    就会得出相反结论。``probabilities["noul"]`` 本就是 structured.py 现场合成的。
+    """
+    joined = _noul_joined(0, 0.95, 0.95, True)
+    joined["inference"]["probabilities"] = {"true": 0.05, "false": 0.95, "noul": 0.05}
+    metrics = compute_metrics([joined], Thresholds(pos=0.75, neg=0.25, margin=0.20))
+    assert metrics["decided_count"] == 1
+    assert metrics["accuracy"] == 1.0  # 按 raw_answer.noul=0.95 → act(true) → 与 label 一致
+
+
+# --- fit-only 阈值选择（§9.4）--------------------------------------------
+def _separable_fit(n_true: int = 60, n_false: int = 40) -> list[dict[str, Any]]:
+    joined = [_noul_joined(i, 0.95, 0.95, True, dedup=f"sha256:fit-true-{i:056d}") for i in range(n_true)]
+    joined += [
+        _noul_joined(1000 + i, 0.05, 0.95, False, dedup=f"sha256:fit-false-{i:056d}")
+        for i in range(n_false)
+    ]
+    return joined
+
+
+def test_select_thresholds_uses_only_fit_join():
+    """结构性保证：``select_thresholds`` 签名里没有 validation 参数。"""
+    import inspect
+
+    parameters = list(inspect.signature(select_thresholds).parameters)
+    assert parameters == ["fit_joined"]
+
+
+def test_select_thresholds_deterministic_tiebreak():
+    """完美可分数据下所有阈值同分，按 (pos-neg) 升序等 tiebreak 选出最窄带。"""
+    thresholds, metrics = select_thresholds(_separable_fit())
+    assert metrics["coverage"] == 1.0
+    assert metrics["accuracy"] == 1.0
+    # (pos-neg) 升序 → 最小 pos-neg 胜出，即 pos=0.50 / neg=0.45（0.05）
+    assert thresholds == Thresholds(pos=0.50, neg=0.45, margin=0.05)
+
+
+def test_select_thresholds_rejects_uncalibratable_data():
+    """全噪声数据（conf 低、标注随机）无法达到 accuracy>=0.80 → 必须失败。"""
+    joined = [_noul_joined(i, 0.5, 0.10, i % 2 == 0) for i in range(100)]
+    with pytest.raises(CalibrationError) as excinfo:
+        select_thresholds(joined)
+    assert excinfo.value.code == "no_valid_threshold"
+
+
+def test_select_thresholds_requires_every_class_supported():
+    """只有单一类别的 fit join 无法校准另一类 → 必须失败。"""
+    joined = [_noul_joined(i, 0.95, 0.95, True) for i in range(100)]
+    with pytest.raises(CalibrationError) as excinfo:
+        select_thresholds(joined)
+    assert excinfo.value.code == "no_valid_threshold"
+
+
+# --- split 规模与泄漏（§9.4）---------------------------------------------
+def test_split_too_small_fails():
+    fit = _separable_fit(60, 40)
+    validation = [_noul_joined(9000 + i, 0.95, 0.95, i % 2 == 0) for i in range(10)]
+    with pytest.raises(CalibrationError) as excinfo:
+        validate_split_sizing(fit, validation)
+    assert excinfo.value.code == "split_too_small"
+
+
+def test_document_key_leak_fails():
+    """同一原始文档出现在两侧即 invalid——否则等于在训练集上测。"""
+    fit = _separable_fit(60, 40)
+    shared = "sha256:shared-document"
+    validation = [_noul_joined(9000 + i, 0.95, 0.95, i % 2 == 0, dedup=shared) for i in range(60)]
+    fit[0]["label"]["source_doc_dedup_key"] = shared
+    with pytest.raises(CalibrationError) as excinfo:
+        validate_split_sizing(fit, validation)
+    assert excinfo.value.code == "split_document_leak"
+
+
+def test_class_sample_insufficient_fails():
+    """noul 每类 validation 至少 25 条；不足即 invalid。"""
+    fit = _separable_fit(60, 40)
+    validation = [_noul_joined(9000 + i, 0.95, 0.95, i < 10) for i in range(60)]
+    with pytest.raises(CalibrationError) as excinfo:
+        validate_split_sizing(fit, validation)
+    assert excinfo.value.code == "class_sample_insufficient"
+
+
+def test_valid_sizing_passes():
+    fit = _separable_fit(60, 40)
+    validation = [
+        _noul_joined(9000 + i, 0.95, 0.95, i % 2 == 0, dedup=f"sha256:val-{i:059d}")
+        for i in range(60)
+    ]
+    validate_split_sizing(fit, validation)  # 不抛即通过
+
+
+def test_score_probability_keys_are_level_indices_not_criteria_text():
+    """回归锁：score 概率键是**档位下标字符串**，不是 criteria 描述文本。
+
+    Laya 取 score argmax 用 `probs.get(str(i), ...)`（``structured.py:185``），
+    而本项目冻结契约的 score criteria 是描述性标签（§5.2）——两套键不同。
+    早先实现拿描述文本匹配，导致合法概率被判为未知、score_potential_coverage
+    恒为 0 且**不抛异常**。此测试把两种键的差异钉死。
+    """
+    thresholds = Thresholds(pos=0.75, neg=0.25, margin=0.20)
+    levels_text = FROZEN_BUSINESS_QUESTIONS["assess"]["completeness"]["criteria"]
+    assert isinstance(levels_text, list)
+    assert levels_text[0] == "almost_no_substantive_information"  # 确认是描述文本
+
+    def joined_with(probabilities: dict[str, float]) -> dict[str, Any]:
+        return {
+            "sample_id": "imp-000001",
+            "label": {
+                "sample_id": "imp-000001",
+                "primitive": "assess",
+                "question_id": "completeness",
+                "human_label": 4,
+                "source_doc_dedup_key": "sha256:doc" + "0" * 60,
+            },
+            "inference": {
+                "sample_id": "imp-000001",
+                "raw_answer": {"type": "score", "answer_confidence": 0.9},
+                "probabilities": probabilities,
+            },
+        }
+
+    by_index = compute_metrics(
+        [joined_with({"0": 0.02, "1": 0.03, "2": 0.05, "3": 0.2, "4": 0.7})], thresholds
+    )
+    assert by_index["score_potential_coverage"] == 1.0
+
+    by_criteria_text = compute_metrics(
+        [joined_with({str(level): 0.2 for level in levels_text})], thresholds
+    )
+    assert by_criteria_text["score_potential_coverage"] == 0.0

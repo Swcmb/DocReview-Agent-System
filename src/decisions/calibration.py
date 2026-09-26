@@ -741,7 +741,9 @@ def _decide(
     label: Mapping[str, Any],
     inference: Mapping[str, Any],
     thresholds: Thresholds,
+    question: Mapping[str, Any] | None = None,
 ) -> tuple[str, str | None, float | None, bool]:
+
     """按 §4.1 三态规则判定单样本。
 
     返回 ``(status, predicted_class, confidence, potential_decided)``。
@@ -752,9 +754,16 @@ def _decide(
     现场合成的，不是模型输出；``answer_confidence`` 也不能用
     ``DecisionResult.confidence`` 替代（那是未校准的归一化熵）。
     choice/score 的 ``probabilities`` 才是模型输出，可以读。
+
+    ``question`` 用于**非冻结契约**的 question——guard 原语（screen）的 noul 来自
+    Laya 自己的 ``laya/presets.guard_questions()``，不在 §5.2 冻结的 11 个业务
+    question 内（§5.2 注：guard 的 noul 无 ``criteria`` 键）。不传时回落到冻结
+    契约，故既有调用方行为完全不变；两者都取不到时 fail-safe 返回 uncertain。
     """
-    question = FROZEN_BUSINESS_QUESTIONS[primitive][question_id]
-    qtype = str(question["type"])
+    resolved = question if question is not None else FROZEN_BUSINESS_QUESTIONS.get(primitive, {}).get(question_id)
+    if not isinstance(resolved, Mapping):
+        return "uncertain", None, None, False
+    qtype = str(resolved.get("type", ""))
     raw = inference.get("raw_answer")
     if not isinstance(raw, dict):
         return "uncertain", None, None, False
@@ -773,7 +782,7 @@ def _decide(
         return "uncertain", None, confidence, False
 
     if qtype == "choice":
-        criteria = question["criteria"]
+        criteria = resolved["criteria"]
         assert isinstance(criteria, dict)
         probabilities = inference.get("probabilities")
         if len(criteria) < 2 or not isinstance(probabilities, dict) or confidence is None:
@@ -802,7 +811,7 @@ def _decide(
     # 故这里必须按 `range(len(levels))` 生成合法下标集——若误拿描述文本去匹配，
     # 合法概率会被全部判为未知，score_potential_coverage 恒为 0 且不抛异常。
     probabilities = inference.get("probabilities")
-    levels = question["criteria"]
+    levels = resolved["criteria"]
     assert isinstance(levels, list)
     valid_level_keys = {str(index) for index in range(len(levels))}
     potential = False

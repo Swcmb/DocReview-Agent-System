@@ -12,6 +12,7 @@ from langchain.schema import HumanMessage
 
 from ..schemas.models import AgentState
 from ..tools.base import BaseTool
+from ..utils.llm import CostTracker, invoke_with_cost, resolve_cost_model
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -189,6 +190,10 @@ class SupervisorAgent:
         """
         self.logger.info("Supervisor: 开始生成/转换规格文档")
 
+        # §11.3：本节点自建**局部** tracker，不挂在共享 Agent 实例上，
+        # 否则两次并发生成会互相污染成本。
+        local_tracker = CostTracker()
+
         try:
             user_task = state.get("user_task", "")
             document_content = state.get("document_content", "")
@@ -199,20 +204,23 @@ class SupervisorAgent:
                 self.logger.info("场景③：文档+任务上下文组合模式")
                 specification = await self._convert_with_context(
                     document=document_content,
-                    task_context=user_task
+                    task_context=user_task,
+                    tracker=local_tracker
                 )
             elif document_content:
                 # 场景②：仅文档内容，转换为规格格式
                 self.logger.info("场景②：文档转换模式")
                 specification = await self.convert_to_spec(
                     document=document_content,
-                    task_context=""
+                    task_context="",
+                    tracker=local_tracker
                 )
             else:
                 # 场景①：仅任务描述，从零生成规格
                 self.logger.info("场景①：任务生成模式")
                 specification = await self.generate_spec_from_task(
-                    task=user_task
+                    task=user_task,
+                    tracker=local_tracker
                 )
 
             # 更新状态
@@ -233,11 +241,19 @@ class SupervisorAgent:
             state["error_code"] = "DOCREVIEW_ERR_SYS_001"
             state["error_message"] = f"规格生成失败: {str(e)}"
             return state
+        finally:
+            # 已花掉的钱必须记账：LLM 调用成功但后续步骤失败时，token 是真实支出。
+            # 放在 finally 覆盖 except 路径，否则预算闸门会被无限重试绕过。
+            if local_tracker.request_count:
+                state["total_llm_cost"] = (
+                    state.get("total_llm_cost", 0.0) + local_tracker.total_cost
+                )
 
     async def convert_to_spec(
         self,
         document: str,
-        task_context: str = ""
+        task_context: str = "",
+        tracker: CostTracker | None = None
     ) -> str:
         """将外部文档转换为标准规格格式
 
@@ -247,6 +263,7 @@ class SupervisorAgent:
         Args:
             document: 原始文档内容，支持 Markdown、纯文本等格式
             task_context: 任务上下文（可选），用于补充审查重点标注
+            tracker: 局部成本追踪器（§11.3），由调用节点传入而非挂在实例上
 
         Returns:
             str: 标准格式的规格文档，包含所有必要章节
@@ -270,12 +287,17 @@ class SupervisorAgent:
 """
 
         # 调用大语言模型执行转换
-        response = await self.llm.agenerate([HumanMessage(content=prompt)])
+        response, _ = await invoke_with_cost(
+            lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+            tracker=tracker if tracker is not None else CostTracker(),
+            model=resolve_cost_model(),
+        )
         return str(response.generations[0][0].text.strip())
 
     async def generate_spec_from_task(
         self,
-        task: str
+        task: str,
+        tracker: CostTracker | None = None
     ) -> str:
         """根据任务描述从零生成规格文档
 
@@ -305,13 +327,18 @@ class SupervisorAgent:
 """
 
         # 调用大语言模型生成规格
-        response = await self.llm.agenerate([HumanMessage(content=prompt)])
+        response, _ = await invoke_with_cost(
+            lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+            tracker=tracker if tracker is not None else CostTracker(),
+            model=resolve_cost_model(),
+        )
         return str(response.generations[0][0].text.strip())
 
     async def _convert_with_context(
         self,
         document: str,
-        task_context: str
+        task_context: str,
+        tracker: CostTracker | None = None
     ) -> str:
         """结合文档和上下文生成规格
 
@@ -342,12 +369,17 @@ class SupervisorAgent:
 """
 
         # 调用大语言模型生成规格
-        response = await self.llm.agenerate([HumanMessage(content=prompt)])
+        response, _ = await invoke_with_cost(
+            lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+            tracker=tracker if tracker is not None else CostTracker(),
+            model=resolve_cost_model(),
+        )
         return str(response.generations[0][0].text.strip())
 
     async def revise_spec(
         self,
-        state: AgentState
+        state: AgentState,
+        tracker: CostTracker | None = None
     ) -> AgentState:
         """根据审查报告修订规格文档
 
@@ -406,7 +438,15 @@ class SupervisorAgent:
                 )
 
             # 调用大语言模型执行修订
-            response = await self.llm.agenerate([HumanMessage(content="".join(prompt_parts))])
+            # §11.3：节点自建**局部** tracker（不挂在共享 Agent 实例上，否则
+            # 两次并发审查会互相污染），调用后把本次成本累加进 state。
+            local_tracker = tracker if tracker is not None else CostTracker()
+            response, cost = await invoke_with_cost(
+                lambda: self.llm.agenerate([HumanMessage(content="".join(prompt_parts))]),
+                tracker=local_tracker,
+                model=resolve_cost_model(),
+            )
+            state["total_llm_cost"] = state.get("total_llm_cost", 0.0) + cost
             revised_spec = str(response.generations[0][0].text.strip())
 
             # 更新状态
@@ -425,7 +465,8 @@ class SupervisorAgent:
 
     async def plan_task(
         self,
-        task: str
+        task: str,
+        tracker: CostTracker | None = None
     ) -> dict[str, Any]:
         """将任务分解为可执行的子任务
 
@@ -468,7 +509,11 @@ class SupervisorAgent:
 """
 
         # 调用大语言模型生成任务规划
-        response = await self.llm.agenerate([HumanMessage(content=prompt)])
+        response, _ = await invoke_with_cost(
+            lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+            tracker=tracker if tracker is not None else CostTracker(),
+            model=resolve_cost_model(),
+        )
         result_text = str(response.generations[0][0].text.strip())
 
         # 尝试解析 JSON 结果
@@ -489,7 +534,8 @@ class SupervisorAgent:
 
     async def execute_task(
         self,
-        state: AgentState
+        state: AgentState,
+        tracker: CostTracker | None = None
     ) -> AgentState:
         """执行实际任务
 
@@ -536,7 +582,14 @@ class SupervisorAgent:
 """
 
             # 调用大语言模型执行任务
-            response = await self.llm.agenerate([HumanMessage(content=prompt)])
+            # §11.3：节点自建局部 tracker，调用后累加进 state。
+            local_tracker = tracker if tracker is not None else CostTracker()
+            response, cost = await invoke_with_cost(
+                lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+                tracker=local_tracker,
+                model=resolve_cost_model(),
+            )
+            state["total_llm_cost"] = state.get("total_llm_cost", 0.0) + cost
             execution_result = str(response.generations[0][0].text.strip())
 
             # 更新状态

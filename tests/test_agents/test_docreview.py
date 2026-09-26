@@ -51,7 +51,9 @@ class _FakeAgent(DocReviewAgent):
         self.default = default
         self.calls: list[str] = []
 
-    async def _think_step(self, step_name, context, num_thoughts=2):  # type: ignore[override]
+    async def _think_step(self, step_name, context, num_thoughts=2, tracker=None):  # type: ignore[override]
+        # T-17：签名多了 `tracker`（§11.3 局部成本追踪器）。double 必须跟着生产
+        # 签名走，否则 review() 传 `tracker=` 时直接 TypeError。
         self.calls.append(step_name)
         return self.responses.get(step_name, self.default)
 
@@ -103,6 +105,8 @@ def _state(**overrides: Any) -> AgentState:
         "error_message": None,
         "total_llm_cost": 0.0,
         "messages": [],
+        # T-16：AgentState 新增 thread_id（入口生成一次并写回）。
+        "thread_id": "",
     }
     state.update(cast("Any", overrides))
     return state
@@ -578,3 +582,69 @@ async def test_think_step_falls_back_when_mcp_degraded(degraded_flag):
         sequential_thinking=cast("SequentialThinkingClient", _Seq()),
     )
     assert await agent._think_step("step", "ctx") == "降级输出"
+
+
+# ─────────────── T-17 §11.3：六步审查成本记账 ───────────────
+
+
+class _ChargingFakeAgent(_FakeAgent):
+    """每步向 tracker 记一笔账，模拟真实 `_llm_think` 的记账行为。
+
+    `_FakeAgent` 直接短路 `_think_step`，因此不产生任何成本；这里补上记账，
+    用来验证 `review()` 是否把六步成本汇总进 `state["total_llm_cost"]`。
+    """
+
+    def __init__(self, *args: Any, per_step: float = 0.01, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.per_step = per_step
+
+    async def _think_step(self, step_name, context, num_thoughts=2, tracker=None):  # type: ignore[override]
+        self.calls.append(step_name)
+        if tracker is not None:
+            tracker.total_cost += self.per_step
+            tracker.request_count += 1
+        return self.responses.get(step_name, self.default)
+
+
+async def test_review_accumulates_six_step_llm_cost():
+    """T-17：六步审查的成本必须汇总进 `state["total_llm_cost"]`。
+
+    改动前 `review()` 建了 tracker 却从不读取，六步 LLM 支出对预算闸门完全隐形。
+    """
+    agent = _ChargingFakeAgent(default="无问题", per_step=0.01)
+
+    out = await agent.review(_state(specification="# 规格\n内容"))
+
+    assert len(agent.calls) == 6, "六步都应被调用"
+    assert out["total_llm_cost"] == pytest.approx(0.06), "六步成本必须按 6×0.01 汇总"
+
+
+async def test_review_cost_accumulates_across_rounds():
+    """T-17：多轮审查成本必须**累加**而非覆盖——覆盖会让长会话成本凭空归零。"""
+    agent = _ChargingFakeAgent(default="无问题", per_step=0.01)
+
+    first = await agent.review(_state(specification="# 规格\n内容"))
+    second = await agent.review(
+        _state(specification="# 规格\n内容", total_llm_cost=first["total_llm_cost"])
+    )
+
+    assert second["total_llm_cost"] > first["total_llm_cost"]
+
+
+async def test_review_accumulates_llm_cost_through_real_invoke_path():
+    """T-17：真实 LLM 路径（`_llm_think` → `invoke_with_cost`）的成本同样进 state。"""
+
+    class _Resp:
+        def __init__(self, text: str) -> None:
+            self.generations = [[type("G", (), {"text": text})()]]
+
+    class _LLM:
+        async def agenerate(self, messages):
+            # 文本需足够长：代价 fallback 走 int(len/4*1.3*0.3)，短文本会截断成 0 token
+            return _Resp("审查输出" * 200)
+
+    agent = DocReviewAgent(llm=cast("Any", _LLM()), sequential_thinking=None)
+
+    out = await agent.review(_state(specification="# 规格\n内容"))
+
+    assert out["total_llm_cost"] > 0, "真实 LLM 路径的成本必须记账"

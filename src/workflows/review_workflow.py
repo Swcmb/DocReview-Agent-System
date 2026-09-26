@@ -38,6 +38,7 @@ from .review_routing import (
     has_unresolved_blocking as has_unresolved_blocking,
 )
 from .review_routing import (
+    BUDGET_ERROR_CODE,
     route_after_approval,
     route_after_evaluate,
     route_after_initialize,
@@ -253,9 +254,15 @@ async def evaluate_result(state: AgentState) -> AgentState:
 
     config = AppConfig()
     max_cost = config.agent_behavior.max_cost_per_task
-    if max_cost > 0 and state.get("total_llm_cost", 0) > max_cost:
-        state["error_code"] = "DOCREVIEW_ERR_LLM_008"
-        state["error_message"] = f"LLM API 成本超预算: ${state['total_llm_cost']:.4f}"
+    total_cost = state.get("total_llm_cost", 0.0) or 0.0
+    if max_cost > 0 and total_cost > max_cost:
+        # §11.3：超预算必须同时置 execution_status="failed" 并写 error/message，
+        # 再由 route_after_evaluate 走 finalize——该错误优先于 max/停滞/结论。
+        # 只写 error_code 而不动 execution_status，会让 CLI 摘要仍把这次审查
+        # 报成「已完成」，掩盖真正的失败原因。
+        state["error_code"] = BUDGET_ERROR_CODE
+        state["error_message"] = f"LLM API 成本超预算: ${total_cost:.4f} > ${max_cost:.2f}"
+        state["execution_status"] = "failed"
 
     logger.info(
         f"审查评估: conclusion={conclusion}, "

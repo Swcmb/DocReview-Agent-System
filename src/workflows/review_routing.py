@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BLOCKING_SEVERITIES",
     "RESOLVED_STATUSES",
+    "BUDGET_ERROR_CODE",
     "has_unresolved_blocking",
     "route_after_initialize",
     "route_after_load_document",
@@ -50,6 +51,15 @@ _FATAL_ERROR_PREFIXES: tuple[str, ...] = (
     "DOCREVIEW_ERR_REV_",
     "DOCREVIEW_ERR_DOC_",
 )
+
+#: LLM 成本超预算（§11.3）。**刻意不并入** ``_FATAL_ERROR_PREFIXES``：
+#: 那三个前缀表示「某个节点失败了」，而预算超限是全局闸门——它不关心是哪个
+#: 节点花的钱，且必须优先于 max/stagnation/结论等一切终止条件。混进同一元组
+#: 会让「哪个守卫在起作用」变得不可读。
+#:
+#: 公开而非私有名：``evaluate_result`` 要写入同一个码，两处各写一个字面量
+#: 迟早会漂移成「写的和判的不是同一个码」——而这种漂移会让闸门静默失效。
+BUDGET_ERROR_CODE = "DOCREVIEW_ERR_LLM_008"
 
 
 def _is_unresolved(issue: dict[str, Any]) -> bool:
@@ -141,9 +151,20 @@ def route_after_evaluate(
 ) -> Literal["user_approval", "revise_spec", "finalize"]:
     """evaluate_result 后的条件路由。
 
-    守卫顺序即优先级：**legacy max → stagnation → 结论**。上限与停滞先于
-    结论判定，否则一个「Pass 但已停滞」的状态会被送去等审批，白等一轮。
+    守卫顺序即优先级：**预算超限 → legacy max → stagnation → 结论**。
+
+    预算排第一的理由不是「顺手」：超预算意味着后续任何 LLM 调用都应当停止，
+    若把它放在结论分支之后，一个「Pass 且未停滞」的状态会被送去等审批，审批
+    通过后 revise/execute 又各调一次 LLM——预算闸门被自己的优先级架空。
+
+    max → stagnation → 结论的相对顺序保留原样：上限与停滞先于结论判定，否则
+    一个「Pass 但已停滞」的状态会被送去等审批，白等一轮。
     """
+    # §11.3：预算超限优先于其他一切终止条件。
+    if state.get("error_code") == BUDGET_ERROR_CODE:
+        logger.info("LLM 成本超预算，强制终止（优先于其他终止条件）")
+        return "finalize"
+
     conclusion = state.get("review_conclusion", "Fail")
     iteration_count = state.get("iteration_count", 0)
     max_iterations = state.get("max_iterations", 10)

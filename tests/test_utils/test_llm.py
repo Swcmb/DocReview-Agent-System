@@ -5,10 +5,17 @@ import pytest
 from src.utils.llm import (
     CostTracker,
     LLM_PRICING,
-    track_llm_cost,
     check_budget,
+    invoke_with_cost,
+    resolve_cost_model,
+    track_llm_cost,
     _extract_tokens,
 )
+
+
+async def _acoro(value):
+    """把同步值包成 awaitable，模拟 `invoke_with_cost` 的 `invoke` 契约。"""
+    return value
 
 
 class TestCostTracker:
@@ -236,3 +243,137 @@ class TestLLMPricing:
             assert completion_price > 0
             assert isinstance(prompt_price, float)
             assert isinstance(completion_price, float)
+
+
+class _FakeGeneration:
+    """最小 Generation 替身：需要 .text，以及可挂 usage 的 .message。"""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.message: _FakeMessage | None = None
+
+
+class _FakeMessage:
+    """最小 message 替身：承载 LangChain 新版 usage_metadata。"""
+
+    def __init__(self, usage: dict | None = None) -> None:
+        self.usage_metadata = usage
+
+
+class _FakeResponse:
+    """最小 LLM 响应替身，形状对齐 LangChain 的 generations[0][0]。"""
+
+    def __init__(self, text: str, llm_output: dict | None = None, usage: dict | None = None):
+        self.generations = [[_FakeGeneration(text)]]
+        self.llm_output = llm_output
+        message = _FakeMessage(usage)
+        self.generations[0][0].message = message
+
+
+class TestInvokeWithCost:
+    """`invoke_with_cost` 统一调用契约（§11.3）。"""
+
+    async def test_returns_response_and_cost(self):
+        """返回 (response, 本次美元成本)，响应原样透传。"""
+        tracker = CostTracker()
+        response = _FakeResponse("hi", llm_output={"token_usage": {"prompt_tokens": 1000, "completion_tokens": 500}})
+
+        returned, cost = await invoke_with_cost(
+            lambda: _acoro(response),
+            tracker=tracker,
+            model="gpt-4o",
+        )
+
+        assert returned is response
+        assert cost > 0
+        assert tracker.total_cost == cost
+
+    async def test_openai_metadata_is_read(self):
+        """OpenAI 风格：llm_output.token_usage(prompt_tokens/completion_tokens)。"""
+        tracker = CostTracker()
+        response = _FakeResponse("x", llm_output={"token_usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0}})
+
+        _, cost = await invoke_with_cost(lambda: _acoro(response), tracker=tracker, model="gpt-4o")
+
+        # 1M prompt tokens @ gpt-4o 的 $2.50/M
+        assert cost == pytest.approx(2.50)
+
+    async def test_anthropic_metadata_is_read(self):
+        """Anthropic 风格：llm_output.usage(input_tokens/output_tokens)。"""
+        tracker = CostTracker()
+        response = _FakeResponse("x", llm_output={"usage": {"input_tokens": 0, "output_tokens": 1_000_000}})
+
+        _, cost = await invoke_with_cost(
+            lambda: _acoro(response), tracker=tracker, model="claude-3-5-sonnet"
+        )
+
+        # 1M completion tokens @ claude-3-5-sonnet 的 $15.00/M
+        assert cost == pytest.approx(15.00)
+
+    async def test_usage_metadata_fallback_path(self):
+        """LangChain 新版：usage_metadata 挂在 message 上。"""
+        tracker = CostTracker()
+        response = _FakeResponse("x", usage={"input_tokens": 1_000_000, "output_tokens": 0})
+
+        _, cost = await invoke_with_cost(lambda: _acoro(response), tracker=tracker, model="gpt-4o")
+
+        assert cost == pytest.approx(2.50)
+
+    async def test_no_usage_uses_existing_estimate_fallback(self):
+        """无 usage 时走既有「按内容长度估算」fallback，而不是记 0 成本。
+
+        记 0 会让预算闸门形同虚设——这是本测试存在的唯一理由。
+        """
+        tracker = CostTracker()
+        response = _FakeResponse("x" * 4000)
+
+        _, cost = await invoke_with_cost(lambda: _acoro(response), tracker=tracker, model="gpt-4o")
+
+        assert cost > 0, "无 usage 时必须按内容长度估算，不能静默记 0"
+        assert tracker.request_count == 1
+
+    async def test_plain_string_response_is_tolerated(self):
+        """响应是纯字符串时不得抛异常。"""
+        tracker = CostTracker()
+
+        returned, cost = await invoke_with_cost(
+            lambda: _acoro("纯文本响应"), tracker=tracker, model="gpt-4o"
+        )
+
+        assert returned == "纯文本响应"
+        assert cost >= 0
+
+    async def test_tracker_accumulates_across_calls(self):
+        """同一局部 tracker 跨多次调用累计（review 的六步共用一个）。"""
+        tracker = CostTracker()
+        response = _FakeResponse("x", llm_output={"token_usage": {"prompt_tokens": 1000, "completion_tokens": 1000}})
+
+        for _ in range(3):
+            await invoke_with_cost(lambda: _acoro(response), tracker=tracker, model="gpt-4o")
+
+        assert tracker.request_count == 3
+        assert tracker.total_cost > 0
+
+    async def test_exception_propagates_without_recording_cost(self):
+        """调用失败时异常上抛，且不记账——没拿到 usage 就不该有成本条目。"""
+        tracker = CostTracker()
+
+        async def _boom():
+            raise RuntimeError("provider 挂了")
+
+        with pytest.raises(RuntimeError):
+            await invoke_with_cost(_boom, tracker=tracker, model="gpt-4o")
+
+        assert tracker.request_count == 0
+        assert tracker.total_cost == 0.0
+
+
+class TestResolveCostModel:
+    """定价表键名必须来自同一处解析。"""
+
+    def test_resolve_cost_model_returns_string(self):
+        assert isinstance(resolve_cost_model(), str)
+
+    def test_resolve_cost_model_is_in_pricing_table(self):
+        """默认模型名必须命中 LLM_PRICING，否则会静默落到兜底价。"""
+        assert resolve_cost_model() in LLM_PRICING

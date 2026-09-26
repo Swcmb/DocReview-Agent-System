@@ -4,6 +4,7 @@
 """
 
 import logging
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional, Dict
 
@@ -154,6 +155,98 @@ def check_budget(
         return True, f"超出预算: ${cost_tracker.total_cost:.4f} > ${max_budget:.2f}"
     
     return False, ""
+
+
+def _response_metadata(response: Any) -> dict:
+    """从 LLM 响应里抽出 ``track_llm_cost`` 认识的元数据形状。
+
+    不同 provider 把 usage 放在不同位置，逐个尝试：
+
+    1. **OpenAI 风格** ``llm_output["token_usage"]``（LangChain OpenAI 走这条）；
+    2. **Anthropic 风格** ``llm_output["usage"]``（``input_tokens``/``output_tokens``）；
+    3. **LangChain 新版** ``usage_metadata``（挂在生成消息上，键名已被规范化）；
+    4. 响应本身就是 dict——直接当元数据用。
+
+    一条都取不到时返回 ``{}``，``track_llm_cost`` 会走既有的「按 content 长度估算」
+    fallback，而不是静默记 0 成本——记 0 会让预算闸门形同虚设。
+    """
+    # 1/2：LangChain 的 llm_output 同时承载 OpenAI 与 Anthropic 两种命名。
+    llm_output = getattr(response, "llm_output", None)
+    if isinstance(llm_output, Mapping):
+        meta = dict(llm_output)
+        if "token_usage" in meta or "usage" in meta:
+            return meta
+
+    # 3：usage_metadata 挂在 generations[0][0].message 上，键名已是
+    # input_tokens/output_tokens，与 _extract_tokens 的 Anthropic 分支一致。
+    try:
+        message = response.generations[0][0].message
+        usage = getattr(message, "usage_metadata", None)
+        if isinstance(usage, Mapping) and usage:
+            return {"usage": dict(usage)}
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # 4：响应本身是 dict。
+    if isinstance(response, Mapping):
+        meta = dict(response)
+        if "token_usage" in meta or "usage" in meta:
+            return meta
+
+    return {}
+
+
+def _response_text(response: Any) -> str:
+    """尽力取出响应文本，供无 usage 时的长度估算 fallback 使用。"""
+    if isinstance(response, str):
+        return response
+    try:
+        return str(response.generations[0][0].text)
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+def resolve_cost_model() -> str:
+    """返回用于成本核算的模型名（必须是 ``LLM_PRICING`` 的键）。
+
+    刻意集中在此：定价表只有一份，模型名若由各 agent 各自解析，早晚会出现某个
+    调用点算出 ``LLM_PRICING.get(model, 默认价)`` 的兜底价而无人察觉。
+    """
+    return get_config().llm.model
+
+
+async def invoke_with_cost(
+    invoke: Callable[[], Awaitable[Any]],
+    *,
+    tracker: CostTracker,
+    model: str,
+) -> tuple[Any, float]:
+    """统一的 LLM 调用契约：返回 ``(response, 本次美元成本)``（§11.3）。
+
+    刻意做成「包一层调用」而不是「传响应进来算账」：usage 只能在 await 之后拿到，
+    而调用点很容易在拿到响应后忘记记账——``total_llm_cost`` 在本次交付前从未被
+    累加过，正是因为记账与调用是分离的两步。
+
+    成本按**局部** ``tracker`` 累加，不挂在共享 Agent 实例上：Agent 实例在
+    workflow 生命周期内复用，把可变成本挂上去会让并发两次审查互相污染。
+
+    Args:
+        invoke: 无参异步可调用，产出 LLM 响应。
+        tracker: 本次调用链的局部成本追踪器。
+        model: 模型名，用于查既有定价表。
+
+    Returns:
+        ``(response, cost)``——``cost`` 为本次调用的美元成本。
+    """
+    response = await invoke()
+
+    metadata = _response_metadata(response)
+    if not metadata:
+        # 无 usage 时把文本塞进 content，让 track_llm_cost 走既有 fallback 估算。
+        metadata = {"content": _response_text(response)}
+
+    cost = track_llm_cost(model, metadata, tracker)
+    return response, cost
 
 
 class LLMError(Exception):

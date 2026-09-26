@@ -84,7 +84,7 @@ async def test_generate_spec_scenario1_task_only_routes_to_generate_from_task(mo
     agent = _make_agent("从零生成的规格")
     called: list[str] = []
 
-    async def _fake_from_task(task: str) -> str:
+    async def _fake_from_task(task: str, tracker: Any = None) -> str:
         called.append(task)
         return "从零生成的规格"
 
@@ -108,7 +108,7 @@ async def test_generate_spec_scenario2_document_only_routes_to_convert(monkeypat
     agent = _make_agent()
     seen: list[tuple[str, str]] = []
 
-    async def _fake_convert(document: str, task_context: str = "") -> str:
+    async def _fake_convert(document: str, task_context: str = "", tracker: Any = None) -> str:
         seen.append((document, task_context))
         return "转换后的规格"
 
@@ -134,7 +134,7 @@ async def test_generate_spec_scenario3_both_prefers_document_as_subject(monkeypa
     agent = _make_agent()
     seen: list[tuple[str, str]] = []
 
-    async def _fake_with_context(document: str, task_context: str) -> str:
+    async def _fake_with_context(document: str, task_context: str, tracker: Any = None) -> str:
         seen.append((document, task_context))
         return "组合规格"
 
@@ -161,7 +161,7 @@ async def test_generate_spec_empty_input_falls_back_to_scenario1(monkeypatch):
     agent = _make_agent()
     called: list[str] = []
 
-    async def _fake_from_task(task: str) -> str:
+    async def _fake_from_task(task: str, tracker: Any = None) -> str:
         called.append(task)
         return "兜底规格"
 
@@ -356,3 +356,66 @@ async def test_generate_spec_tolerates_non_string_inputs(bad_input):
     state = await agent.generate_spec(_state(document_content=cast("Any", bad_input)))
     assert state["error_code"] is None
     assert state["specification"] == "规格正文"
+
+
+# ─────────────── T-17 §11.3：成本记账（generate / revise） ───────────────
+
+# 无 usage 时代价 fallback 走 `int(len(content)/4*1.3*0.3|0.7)`：短文本会被截断成
+# 0 token，从而记 0 成本。故此处用足量文本，确保断言的是「记账通路真的通」，
+# 而不是被文本长度巧合掩盖。
+_LONG_TEXT = "规格正文" * 60
+
+
+async def test_generate_spec_accumulates_llm_cost():
+    """T-17：`generate_spec` 必须把本次 LLM 成本累加进 `state["total_llm_cost"]`。
+
+    改动前三个转换 helper 各自新建 `CostTracker()` 后把成本丢弃，从未进入 state——
+    预算闸门对「生成规格」这段支出完全失明。
+    """
+    agent = _make_agent(_LONG_TEXT)
+
+    out = await agent.generate_spec(_state(user_task="设计用户认证系统"))
+
+    assert out["total_llm_cost"] > 0, "生成规格的 LLM 支出必须记账，否则预算闸门形同虚设"
+
+
+async def test_generate_spec_cost_accumulates_across_calls():
+    """T-17：连续两次生成必须**累加**而非覆盖——覆盖会让长会话成本凭空归零。"""
+    agent = _make_agent(_LONG_TEXT)
+
+    first = await agent.generate_spec(_state(user_task="任务 A"))
+    second = await agent.generate_spec(
+        _state(user_task="任务 B", total_llm_cost=first["total_llm_cost"])
+    )
+
+    assert second["total_llm_cost"] > first["total_llm_cost"]
+
+
+async def test_generate_spec_spent_cost_survives_downstream_failure(monkeypatch):
+    """T-17：已花掉的钱在下游失败时**仍要**累加（`finally` 覆盖 `except` 路径）。
+
+    LLM 已回包计费、其后处理崩溃时 token 是真实支出；不记账等于给失败重试发免单。
+    """
+    agent = _make_agent()
+
+    async def _charge_then_crash(task: str, tracker: Any = None) -> str:
+        tracker.total_cost += 0.25
+        tracker.request_count += 1
+        raise RuntimeError("转换后崩溃")
+
+    monkeypatch.setattr(agent, "generate_spec_from_task", _charge_then_crash)
+
+    out = await agent.generate_spec(_state(user_task="设计用户认证系统"))
+
+    assert out["error_code"] == "DOCREVIEW_ERR_SYS_001"
+    assert out["total_llm_cost"] == pytest.approx(0.25), "失败路径上已花成本必须记账"
+
+
+async def test_revise_spec_accumulates_llm_cost():
+    """T-17：`revise_spec` 必须把本次 LLM 成本累加进 `state["total_llm_cost"]`。"""
+    agent = _make_agent("修订后的规格")
+    state = _state(specification="原规格", review_reports=[_mk_report([_mk_issue()])])
+
+    out = await agent.revise_spec(state)
+
+    assert out["total_llm_cost"] > 0, "修订的 LLM 支出必须累加进 state"

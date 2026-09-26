@@ -1,5 +1,7 @@
 """审查工作流测试模块 / Review Workflow Test Module"""
 
+from typing import cast
+
 import pytest
 
 from src.workflows.review_workflow import (
@@ -17,8 +19,10 @@ from src.workflows.review_workflow import (
     _save_review_history,
     _print_summary,
 )
+from src.schemas.models import AgentState
 from src.state.agent_state import create_initial_state
 from src.utils.llm import CostTracker
+from src.workflows.review_routing import BUDGET_ERROR_CODE
 
 
 @pytest.fixture
@@ -643,3 +647,107 @@ async def test_workflow_state_persistence_fields():
 
     for field in required_fields:
         assert field in result, f"Missing required field: {field}"
+
+
+class _StubAgentBehavior:
+    def __init__(self, max_cost: float) -> None:
+        self.max_cost_per_task = max_cost
+
+
+class _StubConfig:
+    def __init__(self, max_cost: float) -> None:
+        self.agent_behavior = _StubAgentBehavior(max_cost)
+
+
+class TestBudgetGate:
+    """§11.3 预算优先级：超预算必须显式失败并优先于其他终止条件。"""
+
+    async def test_evaluate_result_marks_execution_failed_on_over_budget(self, monkeypatch):
+        """超预算时 evaluate_result 必须同时置 error_code 与 execution_status="failed"。"""
+        monkeypatch.setattr(
+            "src.workflows.review_workflow.AppConfig", lambda: _StubConfig(max_cost=1.0)
+        )
+        state = cast("AgentState", {
+            **create_initial_state(),
+            "review_conclusion_data": {"review_conclusion": "Fail"},
+            "total_llm_cost": 2.5,
+        })
+
+        out = await evaluate_result(state)
+
+        assert out["error_code"] == BUDGET_ERROR_CODE
+        assert out["execution_status"] == "failed", (
+            "只写 error_code 会让 CLI 摘要仍报「已完成」，掩盖真实失败原因"
+        )
+        assert "超预算" in out["error_message"]
+
+    async def test_evaluate_result_under_budget_is_untouched(self, monkeypatch):
+        """未超预算时不得写入预算错误码。"""
+        monkeypatch.setattr(
+            "src.workflows.review_workflow.AppConfig", lambda: _StubConfig(max_cost=10.0)
+        )
+        state = cast("AgentState", {
+            **create_initial_state(),
+            "review_conclusion_data": {"review_conclusion": "Fail"},
+            "total_llm_cost": 0.5,
+        })
+
+        out = await evaluate_result(state)
+
+        assert out["error_code"] is None
+        assert out["execution_status"] == "pending"
+
+    def test_route_after_evaluate_budget_error_goes_to_finalize(self):
+        """DOCREVIEW_ERR_LLM_008 → finalize。"""
+        state = cast("AgentState", {
+            "error_code": BUDGET_ERROR_CODE,
+            "review_conclusion": "Fail",
+            "iteration_count": 0,
+            "max_iterations": 10,
+            "stagnation_count": 0,
+        })
+
+        assert route_after_evaluate(state) == "finalize"
+
+    def test_budget_error_beats_pass_conclusion(self):
+        """优先级核心：即使结论是 Pass，超预算也必须终止而不是送去等审批。
+
+        若这里放行，审批通过后 revise/execute 又各调一次 LLM，预算闸门被自己的
+        优先级架空。
+        """
+        state = cast("AgentState", {
+            "error_code": BUDGET_ERROR_CODE,
+            "review_conclusion": "Pass",
+            "iteration_count": 0,
+            "max_iterations": 10,
+            "stagnation_count": 0,
+        })
+
+        assert route_after_evaluate(state) == "finalize"
+        assert state.get("awaiting_approval") is not True
+
+    def test_budget_error_beats_stagnation_and_max(self):
+        """同样压过 max_iterations 与 stagnation 两个既有终止条件。"""
+        for extra in ({"iteration_count": 99}, {"stagnation_count": 99}):
+            state = cast("AgentState", {
+                "error_code": BUDGET_ERROR_CODE,
+                "review_conclusion": "Fail",
+                "iteration_count": 0,
+                "max_iterations": 10,
+                "stagnation_threshold": 3,
+                "stagnation_count": 0,
+                **extra,
+            })
+            assert route_after_evaluate(state) == "finalize", extra
+
+    def test_other_llm_errors_do_not_force_finalize(self):
+        """非预算的 LLM 错误码不得触发该守卫——守卫只认预算这一个码。"""
+        state = cast("AgentState", {
+            "error_code": "DOCREVIEW_ERR_LLM_001",
+            "review_conclusion": "Fail",
+            "iteration_count": 0,
+            "max_iterations": 10,
+            "stagnation_count": 0,
+        })
+
+        assert route_after_evaluate(state) == "revise_spec"

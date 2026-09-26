@@ -28,6 +28,7 @@ from langchain.schema import HumanMessage
 
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..decisions.issue_id import assign_issue_ids
+from ..utils.llm import CostTracker, invoke_with_cost, resolve_cost_model
 from ..schemas.models import (
     SEVERITY_BLOCKING,
     SEVERITY_HIGH,
@@ -189,27 +190,37 @@ class DocReviewAgent:
         
         self.logger.info(f"DocReview: 开始第 {iteration} 轮审查")
         
+        # §11.3：本轮自建**局部** tracker。刻意不放 self 上——Agent 实例在
+        # workflow 生命周期内复用，挂实例字段会让两次并发审查互相污染成本。
+        local_tracker = CostTracker()
+
         try:
-            core_loop = await self._extract_core_loop(spec)
+            core_loop = await self._extract_core_loop(spec, tracker=local_tracker)
             
-            consistency_issues = await self._check_consistency(spec, core_loop)
+            consistency_issues = await self._check_consistency(
+                spec, core_loop, tracker=local_tracker
+            )
             
             tech_context = await self._enrich_context(spec)
             
-            atomize_issues, atomic_reqs = await self._atomize_requirements(spec, core_loop)
+            atomize_issues, atomic_reqs = await self._atomize_requirements(
+                spec, core_loop, tracker=local_tracker
+            )
             
             feasibility_issues, dep_graph = await self._deduce_feasibility(
-                spec, atomic_reqs, tech_context
+                spec, atomic_reqs, tech_context, tracker=local_tracker
             )
             
             risk_issues = await self._detect_risks(
                 spec, dep_graph,
                 consistency_issues + atomize_issues + feasibility_issues,
+                tracker=local_tracker,
             )
             
             exec_issues = await self._review_executability(
                 spec,
                 consistency_issues + atomize_issues + feasibility_issues + risk_issues,
+                tracker=local_tracker,
             )
             
             all_issues = (
@@ -260,12 +271,21 @@ class DocReviewAgent:
             # 否则 route_after_evaluate 的轮次上限分支永不成立，循环无法终止。
             state["iteration_count"] = iteration
             return state
+        finally:
+            # 中途中断的轮次同样已经花掉了钱：崩在第 3 步时前两步的 token 是
+            # 真实支出。不累计等于给无限重试发免单，预算闸门会形同虚设。
+            # 放在 finally 而非 try 尾部，正是为了覆盖 except 路径。
+            if local_tracker.request_count:
+                state["total_llm_cost"] = (
+                    state.get("total_llm_cost", 0.0) + local_tracker.total_cost
+                )
     
     async def _think_step(
         self,
         step_name: str,
         context: str,
         num_thoughts: int = 2,
+        tracker: CostTracker | None = None,
     ) -> str:
         """通过 Sequential Thinking MCP 进行多步推理
         
@@ -275,12 +295,14 @@ class DocReviewAgent:
             step_name: 步骤名称
             context: 上下文内容
             num_thoughts: 思维迭代次数
-            
+            tracker: 局部成本追踪器（§11.3）；仅 LLM 降级路径产生成本，
+                MCP 路径不计入美元成本（Laya usage 走 DecisionAudit.usage）
+
         Returns:
             最终推理结果
         """
         if not self.sequential_thinking or self.sequential_thinking.is_degraded:
-            return await self._llm_think(step_name, context)
+            return await self._llm_think(step_name, context, tracker)
         
         try:
             thoughts = []
@@ -297,14 +319,20 @@ class DocReviewAgent:
             
         except Exception as e:
             self.logger.warning(f"Sequential Thinking 调用失败，降级为纯 LLM: {e}")
-            return await self._llm_think(step_name, context)
+            return await self._llm_think(step_name, context, tracker)
     
-    async def _llm_think(self, step_name: str, context: str) -> str:
+    async def _llm_think(
+        self,
+        step_name: str,
+        context: str,
+        tracker: CostTracker | None = None,
+    ) -> str:
         """纯 LLM 推理（降级模式）
         
         Args:
             step_name: 步骤名称
             context: 上下文内容
+            tracker: 局部成本追踪器（§11.3），由 review() 自建并逐层传入
             
         Returns:
             LLM 生成的推理结果
@@ -316,7 +344,11 @@ class DocReviewAgent:
 {context}
 
 {STRUCTURED_OUTPUT_FORMAT}"""
-        response = await self.llm.agenerate([HumanMessage(content=prompt)])
+        response, _ = await invoke_with_cost(
+            lambda: self.llm.agenerate([HumanMessage(content=prompt)]),
+            tracker=tracker if tracker is not None else CostTracker(),
+            model=resolve_cost_model(),
+        )
         return response.generations[0][0].text.strip()
     
     async def _enrich_context(self, spec: str) -> Optional[TechContext]:
@@ -362,7 +394,11 @@ class DocReviewAgent:
         return ""
     
 
-    async def _extract_core_loop(self, spec: str) -> CoreLoopAnalysis:
+    async def _extract_core_loop(
+        self,
+        spec: str,
+        tracker: CostTracker | None = None,
+    ) -> CoreLoopAnalysis:
         """步骤 1：核心闭环提取
         
         识别规格文档中的主业务流程、入口点、出口点和潜在断点。
@@ -378,6 +414,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "core_loop_extraction",
             f"分析以下规格文档的核心业务流程和闭环完整性：\n\n{spec}",
+            tracker=tracker,
         )
         
         flows = self._extract_list_from_text(thinking_result, ["流程", "process", "flow"])
@@ -394,6 +431,7 @@ class DocReviewAgent:
         self,
         spec: str,
         core_loop: CoreLoopAnalysis,
+        tracker: CostTracker | None = None,
     ) -> List[IssueStatus]:
         """步骤 2：一致性检查
         
@@ -411,6 +449,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "consistency_check",
             f"检查以下规格的一致性问题：\n\n{spec}\n\n核心闭环：{core_loop.flows}",
+            tracker=tracker,
         )
         
         issues = self._parse_issues_from_text(
@@ -425,6 +464,7 @@ class DocReviewAgent:
         self,
         spec: str,
         core_loop: CoreLoopAnalysis,
+        tracker: CostTracker | None = None,
     ) -> Tuple[List[IssueStatus], List[AtomicRequirement]]:
         """步骤 3：需求原子化
         
@@ -442,6 +482,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "requirement_atomization",
             f"分析以下规格的需求完整性和原子化程度：\n\n{spec}\n\n核心闭环：{core_loop.flows}",
+            tracker=tracker,
         )
         
         issues = self._parse_issues_from_text(
@@ -459,6 +500,7 @@ class DocReviewAgent:
         spec: str,
         atomic_reqs: List[AtomicRequirement],
         context: Optional[TechContext],
+        tracker: CostTracker | None = None,
     ) -> Tuple[List[IssueStatus], Dict[str, Any]]:
         """步骤 4：技术可行性推导
         
@@ -479,6 +521,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "feasibility_deduction",
             f"分析以下规格的技术可行性和依赖关系：\n\n{spec}{context_str}",
+            tracker=tracker,
         )
         
         issues = self._parse_issues_from_text(
@@ -496,6 +539,7 @@ class DocReviewAgent:
         spec: str,
         dep_graph: Dict[str, Any],
         prev_issues: List[IssueStatus],
+        tracker: CostTracker | None = None,
     ) -> List[IssueStatus]:
         """步骤 5：风险检测
         
@@ -514,6 +558,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "risk_detection",
             f"识别以下规格的潜在风险：\n\n{spec}\n\n依赖关系：{dep_graph}\n\n已知问题：{prev_issues}",
+            tracker=tracker,
         )
         
         issues = self._parse_issues_from_text(
@@ -528,6 +573,7 @@ class DocReviewAgent:
         self,
         spec: str,
         all_issues: List[IssueStatus],
+        tracker: CostTracker | None = None,
     ) -> List[IssueStatus]:
         """步骤 6：可执行性审查
         
@@ -545,6 +591,7 @@ class DocReviewAgent:
         thinking_result = await self._think_step(
             "executability_review",
             f"从开发者视角审查以下规格的可执行性：\n\n{spec}\n\n已知问题：{all_issues}",
+            tracker=tracker,
         )
         
         issues = self._parse_issues_from_text(

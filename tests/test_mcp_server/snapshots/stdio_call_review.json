@@ -1,0 +1,41 @@
+{
+  "id": 7,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "审查完成！共发现 1 个问题:\n- 术语不一致",
+        "type": "text"
+      }
+    ],
+    "metadata": {
+      "issue_count": 1,
+      "iteration_count": 1,
+      "reports": [
+        {
+          "highlights": [],
+          "issues": [
+            {
+              "description": "术语不一致",
+              "issue_id": "MD-1-1",
+              "issue_type": "ConsistencyCheck",
+              "location": "第 3 节",
+              "severity": "Medium",
+              "status": "open",
+              "suggestion": "统一术语"
+            }
+          ],
+          "iteration": 1,
+          "next_steps": "",
+          "open_questions": [],
+          "review_conclusion": "Pass",
+          "review_summary": "发现 1 个问题",
+          "timestamp": "2026-09-26T00:00:00"
+        }
+      ],
+      "review_conclusion": "Pass",
+      "success": true,
+      "total_llm_cost": 0.0123
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "description": "文档审查请求",
+  "properties": {
+    "doc_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "待审查文档路径",
+      "title": "Doc Path"
+    },
+    "max_iterations": {
+      "default": 10,
+      "description": "最大审查迭代次数",
+      "title": "Max Iterations",
+      "type": "integer"
+    },
+    "task": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "任务描述",
+      "title": "Task"
+    }
+  },
+  "title": "ReviewRequest",
+  "type": "object"
+}

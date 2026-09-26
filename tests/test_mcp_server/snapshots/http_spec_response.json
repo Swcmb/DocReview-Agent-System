@@ -1,0 +1,27 @@
+{
+  "description": "规格生成响应",
+  "properties": {
+    "spec_version": {
+      "description": "规格版本",
+      "title": "Spec Version",
+      "type": "integer"
+    },
+    "specification": {
+      "description": "生成的规格文档",
+      "title": "Specification",
+      "type": "string"
+    },
+    "success": {
+      "description": "是否成功",
+      "title": "Success",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "success",
+    "specification",
+    "spec_version"
+  ],
+  "title": "SpecGenerateResponse",
+  "type": "object"
+}

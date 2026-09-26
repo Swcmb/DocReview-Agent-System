@@ -1,0 +1,430 @@
+{
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "description": "健康检查响应",
+        "properties": {
+          "llm_available": {
+            "description": "LLM 是否可用",
+            "title": "Llm Available",
+            "type": "boolean"
+          },
+          "mcp_services": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "description": "MCP 服务状态",
+            "title": "Mcp Services",
+            "type": "object"
+          },
+          "status": {
+            "description": "服务状态",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "llm_available",
+          "mcp_services"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "ReviewRequest": {
+        "description": "文档审查请求",
+        "properties": {
+          "doc_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "待审查文档路径",
+            "title": "Doc Path"
+          },
+          "max_iterations": {
+            "default": 10,
+            "description": "最大审查迭代次数",
+            "title": "Max Iterations",
+            "type": "integer"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "任务描述",
+            "title": "Task"
+          }
+        },
+        "title": "ReviewRequest",
+        "type": "object"
+      },
+      "ReviewResponse": {
+        "description": "文档审查响应",
+        "properties": {
+          "issues": {
+            "description": "发现的问题列表",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "iteration_count": {
+            "description": "迭代轮次",
+            "title": "Iteration Count",
+            "type": "integer"
+          },
+          "reports": {
+            "description": "审查报告列表",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Reports",
+            "type": "array"
+          },
+          "review_conclusion": {
+            "description": "审查结论",
+            "title": "Review Conclusion",
+            "type": "string"
+          },
+          "success": {
+            "description": "是否成功",
+            "title": "Success",
+            "type": "boolean"
+          },
+          "total_llm_cost": {
+            "description": "LLM 成本",
+            "title": "Total Llm Cost",
+            "type": "number"
+          }
+        },
+        "required": [
+          "success",
+          "review_conclusion",
+          "iteration_count",
+          "total_llm_cost"
+        ],
+        "title": "ReviewResponse",
+        "type": "object"
+      },
+      "SpecGenerateRequest": {
+        "description": "规格生成请求",
+        "properties": {
+          "document_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "参考文档内容",
+            "title": "Document Content"
+          },
+          "task": {
+            "description": "任务描述",
+            "title": "Task",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task"
+        ],
+        "title": "SpecGenerateRequest",
+        "type": "object"
+      },
+      "SpecGenerateResponse": {
+        "description": "规格生成响应",
+        "properties": {
+          "spec_version": {
+            "description": "规格版本",
+            "title": "Spec Version",
+            "type": "integer"
+          },
+          "specification": {
+            "description": "生成的规格文档",
+            "title": "Specification",
+            "type": "string"
+          },
+          "success": {
+            "description": "是否成功",
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "specification",
+          "spec_version"
+        ],
+        "title": "SpecGenerateResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "DocReview MCP Server",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "post": {
+        "description": "MCP JSON-RPC 端点",
+        "operationId": "mcp_json_rpc__post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Request",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mcp Json Rpc"
+      }
+    },
+    "/generate-spec": {
+      "post": {
+        "description": "生成规格文档\n\nArgs:\n    request: 规格生成请求参数\n\nReturns:\n    SpecGenerateResponse: 规格文档",
+        "operationId": "generate_spec_generate_spec_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpecGenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpecGenerateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Spec"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "健康检查",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Check"
+      }
+    },
+    "/invoke": {
+      "post": {
+        "description": "通用工具调用接口（MCP JSON-RPC 兼容）",
+        "operationId": "invoke_tool_invoke_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Request",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Invoke Tool"
+      }
+    },
+    "/review": {
+      "post": {
+        "description": "执行文档审查\n\nArgs:\n    request: 审查请求参数\n\nReturns:\n    ReviewResponse: 审查结果",
+        "operationId": "review_document_review_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Document"
+      }
+    },
+    "/tools": {
+      "get": {
+        "description": "列出所有可用工具",
+        "operationId": "list_tools_tools_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Tools"
+      }
+    }
+  }
+}

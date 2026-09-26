@@ -1,0 +1,30 @@
+{
+  "description": "健康检查响应",
+  "properties": {
+    "llm_available": {
+      "description": "LLM 是否可用",
+      "title": "Llm Available",
+      "type": "boolean"
+    },
+    "mcp_services": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "description": "MCP 服务状态",
+      "title": "Mcp Services",
+      "type": "object"
+    },
+    "status": {
+      "description": "服务状态",
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "llm_available",
+    "mcp_services"
+  ],
+  "title": "HealthResponse",
+  "type": "object"
+}

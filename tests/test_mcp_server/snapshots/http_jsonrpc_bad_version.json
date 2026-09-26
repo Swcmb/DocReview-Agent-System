@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32600,
+    "message": "无效的 JSON-RPC 版本"
+  },
+  "id": 2,
+  "jsonrpc": "2.0"
+}

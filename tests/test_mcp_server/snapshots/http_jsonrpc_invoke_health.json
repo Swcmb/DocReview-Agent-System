@@ -1,0 +1,12 @@
+{
+  "id": 4,
+  "jsonrpc": "2.0",
+  "result": {
+    "llm_available": true,
+    "mcp_services": {
+      "context7": true,
+      "sequential_thinking": true
+    },
+    "status": "healthy"
+  }
+}

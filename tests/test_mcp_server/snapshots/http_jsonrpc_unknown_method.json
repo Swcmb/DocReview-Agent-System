@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32601,
+    "message": "未知方法: no_such_method"
+  },
+  "id": 3,
+  "jsonrpc": "2.0"
+}

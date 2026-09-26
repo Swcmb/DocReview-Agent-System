@@ -1,0 +1,51 @@
+{
+  "description": "文档审查响应",
+  "properties": {
+    "issues": {
+      "description": "发现的问题列表",
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Issues",
+      "type": "array"
+    },
+    "iteration_count": {
+      "description": "迭代轮次",
+      "title": "Iteration Count",
+      "type": "integer"
+    },
+    "reports": {
+      "description": "审查报告列表",
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Reports",
+      "type": "array"
+    },
+    "review_conclusion": {
+      "description": "审查结论",
+      "title": "Review Conclusion",
+      "type": "string"
+    },
+    "success": {
+      "description": "是否成功",
+      "title": "Success",
+      "type": "boolean"
+    },
+    "total_llm_cost": {
+      "description": "LLM 成本",
+      "title": "Total Llm Cost",
+      "type": "number"
+    }
+  },
+  "required": [
+    "success",
+    "review_conclusion",
+    "iteration_count",
+    "total_llm_cost"
+  ],
+  "title": "ReviewResponse",
+  "type": "object"
+}

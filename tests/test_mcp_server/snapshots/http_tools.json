@@ -1,0 +1,46 @@
+{
+  "tools": [
+    {
+      "description": "执行文档审查，对产品需求文档、技术方案等进行六步审查",
+      "name": "review_document",
+      "parameters": {
+        "doc_path": {
+          "description": "待审查文档路径",
+          "optional": true,
+          "type": "string"
+        },
+        "max_iterations": {
+          "default": 10,
+          "description": "最大审查迭代次数",
+          "type": "integer"
+        },
+        "task": {
+          "description": "任务描述",
+          "optional": true,
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "根据任务描述生成结构化规格文档",
+      "name": "generate_spec",
+      "parameters": {
+        "document_content": {
+          "description": "参考文档内容",
+          "optional": true,
+          "type": "string"
+        },
+        "task": {
+          "description": "任务描述",
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "检查 MCP Server 健康状态",
+      "name": "health_check",
+      "parameters": {}
+    }
+  ]
+}

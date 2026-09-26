@@ -1,0 +1,28 @@
+{
+  "description": "规格生成请求",
+  "properties": {
+    "document_content": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "参考文档内容",
+      "title": "Document Content"
+    },
+    "task": {
+      "description": "任务描述",
+      "title": "Task",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task"
+  ],
+  "title": "SpecGenerateRequest",
+  "type": "object"
+}

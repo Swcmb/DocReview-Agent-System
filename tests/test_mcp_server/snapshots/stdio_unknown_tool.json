@@ -1,0 +1,16 @@
+{
+  "id": 5,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "未知工具: nope",
+        "type": "text"
+      }
+    ],
+    "metadata": {
+      "error": "未知工具: nope",
+      "success": false
+    }
+  }
+}

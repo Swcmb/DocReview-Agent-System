@@ -1,0 +1,16 @@
+{
+  "id": 8,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "# 规格\n\n## 概述\n占位",
+        "type": "text"
+      }
+    ],
+    "metadata": {
+      "spec_version": 1,
+      "success": true
+    }
+  }
+}

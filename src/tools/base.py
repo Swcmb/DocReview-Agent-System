@@ -4,9 +4,10 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, Field
+
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -27,8 +28,8 @@ class ToolValidationError(ToolExecutionError):
 class ToolResult(BaseModel):
     """工具执行结果基类 / Tool Result Base Model"""
     success: bool = Field(description="执行是否成功 / Whether execution succeeded")
-    data: Optional[Any] = Field(default=None, description="执行结果数据 / Result data")
-    error: Optional[str] = Field(default=None, description="错误信息 / Error message")
+    data: Any | None = Field(default=None, description="执行结果数据 / Result data")
+    error: str | None = Field(default=None, description="错误信息 / Error message")
     metadata: dict[str, Any] = Field(default_factory=dict, description="附加元数据 / Additional metadata")
 
 
@@ -69,7 +70,7 @@ class BaseTool(ABC):
         """
         pass
 
-    def validate_params(self, **params) -> tuple[bool, Optional[str]]:
+    def validate_params(self, **params) -> tuple[bool, str | None]:
         """验证参数 / Validate Parameters
 
         Args:

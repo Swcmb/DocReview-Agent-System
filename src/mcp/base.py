@@ -2,24 +2,23 @@
 import asyncio
 import logging
 import subprocess
-import signal
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Union
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # 支持两种进程类型：subprocess.Popen 和 asyncio.subprocess.Process
-ProcessType = Union[subprocess.Popen, asyncio.subprocess.Process]
+ProcessType = subprocess.Popen | asyncio.subprocess.Process
 
 @dataclass
 class MCPProcess:
     """MCP 进程信息"""
     process: ProcessType
     start_time: datetime
-    command: List[str]
-    cwd: Optional[str] = None
+    command: list[str]
+    cwd: str | None = None
 
 class MCPError(Exception):
     """MCP 相关错误基类"""
@@ -45,48 +44,48 @@ class MCPResponseError(MCPError):
 
 class BaseMCPClient(ABC):
     """MCP 客户端基类"""
-    
+
     def __init__(
         self,
         timeout: int = 30,
         max_retries: int = 3,
-        retry_delays: List[int] = None
+        retry_delays: list[int] = None
     ):
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delays = retry_delays or [1, 2, 4]
-        self.processes: Dict[str, MCPProcess] = {}
+        self.processes: dict[str, MCPProcess] = {}
         self.logger = logging.getLogger(self.__class__.__name__)
         self._degraded = False
-    
+
     @property
     def is_degraded(self) -> bool:
         """MCP 服务是否处于降级模式"""
         return self._degraded
-    
+
     @abstractmethod
     async def start(self) -> bool:
         """启动 MCP 服务"""
         pass
-    
+
     @abstractmethod
     async def stop(self) -> None:
         """停止 MCP 服务"""
         pass
-    
+
     @abstractmethod
     async def health_check(self) -> bool:
         """健康检查"""
         pass
-    
+
     async def _send_request(
         self,
         method: str,
-        params: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """发送 JSON-RPC 请求（由子类实现具体协议）"""
         raise NotImplementedError
-    
+
     async def _execute_with_retry(
         self,
         func,
@@ -101,29 +100,29 @@ class BaseMCPClient(ABC):
                     func(*args, **kwargs),
                     timeout=self.timeout
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 last_error = MCPTimeoutError(f"MCP 调用超时（尝试 {attempt + 1}/{self.max_retries}）")
                 self.logger.warning(f"MCP 调用超时: {last_error}")
             except MCPError as e:
                 last_error = e
                 self.logger.warning(f"MCP 调用失败: {e}")
-            
+
             if attempt < self.max_retries - 1:
                 delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
                 self.logger.info(f"等待 {delay}s 后重试...")
                 await asyncio.sleep(delay)
-        
+
         self._degraded = True
         raise last_error
-    
+
     async def _terminate_process(self, name: str, timeout: int = 5) -> None:
         """安全终止进程"""
         if name not in self.processes:
             return
-        
+
         proc_info = self.processes[name]
         proc = proc_info.process
-        
+
         try:
             # 判断进程类型
             if isinstance(proc, asyncio.subprocess.Process):
@@ -132,7 +131,7 @@ class BaseMCPClient(ABC):
                     proc.terminate()
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=timeout)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         proc.kill()
                         await proc.wait()
             else:
@@ -144,7 +143,7 @@ class BaseMCPClient(ABC):
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
-            
+
             del self.processes[name]
             self.logger.info(f"MCP 进程 {name} 已终止")
         except Exception as e:
@@ -152,7 +151,7 @@ class BaseMCPClient(ABC):
             # 即使失败也尝试从字典中移除
             if name in self.processes:
                 del self.processes[name]
-    
+
     async def _cleanup_all(self) -> None:
         """清理所有 MCP 进程"""
         for name in list(self.processes.keys()):

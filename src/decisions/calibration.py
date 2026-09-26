@@ -885,7 +885,12 @@ def expected_calibration_error(samples: Sequence[EvalSample]) -> tuple[float, li
         if count == 0:
             bins.append(EceBin(count=0, mean_confidence=None, accuracy=None))
             continue
-        mean_confidence = sum(float(s["confidence"]) for s in bucket) / count  # type: ignore[arg-type]
+        # 先物化成 list 再求和：生成器直接喂给 sum() 时 mypy 会选错重载
+        # （推成 Iterable[bool]），而 sum(生成器) 与 sum(列表) 运行期完全等价。
+        # confidence 在样本 TypedDict 里声明为 float | None；此处沿用原有的
+        # arg-type 忽略，保持既有运行期行为不变（None 的可达性见 T-20 提交说明）。
+        confidences = [float(s["confidence"]) for s in bucket]  # type: ignore[arg-type]
+        mean_confidence = sum(confidences) / count
         accuracy = sum(1 for s in bucket if s["predicted"] == s["human_label"]) / count
         ece += (count / total) * abs(mean_confidence - accuracy)
         bins.append(

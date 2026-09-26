@@ -8,6 +8,7 @@ import sys
 
 from src.mcp_server.server import start_server
 
+
 def main():
     parser = argparse.ArgumentParser(description="启动 DocReview MCP Server")
     parser.add_argument(
@@ -26,19 +27,19 @@ def main():
         action="store_true",
         help="启用调试模式"
     )
-    
+
     args = parser.parse_args()
-    
+
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)]
     )
-    
+
     logger = logging.getLogger("mcp_server")
-    logger.info(f"准备启动 DocReview MCP Server...")
+    logger.info("准备启动 DocReview MCP Server...")
     logger.info(f"绑定地址: http://{args.host}:{args.port}")
-    
+
     try:
         asyncio.run(start_server(host=args.host, port=args.port))
     except KeyboardInterrupt:

@@ -4,9 +4,9 @@
 """
 
 import asyncio
-from pathlib import Path
-from typing import Generator
 import tempfile
+from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel

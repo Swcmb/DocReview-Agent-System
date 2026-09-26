@@ -14,8 +14,8 @@
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import UTC, datetime
+from typing import Any
 
 try:
     from langchain.chat_models import BaseChatModel
@@ -26,10 +26,9 @@ except ImportError:
         BaseChatModel = Any
 from langchain.schema import HumanMessage
 
-from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..decisions.issue_id import assign_issue_ids
 from ..decisions.types import DecisionContext
-from ..utils.llm import CostTracker, invoke_with_cost, resolve_cost_model
+from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import (
     SEVERITY_BLOCKING,
     SEVERITY_HIGH,
@@ -40,9 +39,9 @@ from ..schemas.models import (
     IssueStatus,
     ReviewConclusion,
     ReviewReport,
-    generate_issue_id,
 )
 from ..tools.base import BaseTool
+from ..utils.llm import CostTracker, invoke_with_cost, resolve_cost_model
 
 logger = logging.getLogger(__name__)
 
@@ -50,39 +49,39 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CoreLoopAnalysis:
     """核心闭环分析结果
-    
+
     存储从规格文档中提取的核心业务流程分析信息。
     """
-    flows: List[str] = field(default_factory=list)
-    breaks: List[str] = field(default_factory=list)
-    entry_points: List[str] = field(default_factory=list)
-    exit_points: List[str] = field(default_factory=list)
+    flows: list[str] = field(default_factory=list)
+    breaks: list[str] = field(default_factory=list)
+    entry_points: list[str] = field(default_factory=list)
+    exit_points: list[str] = field(default_factory=list)
 
 
 @dataclass
 class AtomicRequirement:
     """原子化需求
-    
+
     表示已分解为最小可验证单元的功能需求。
     """
     id: str
     description: str
     priority: str
-    acceptance_criteria: List[str] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
-    risks: List[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
 
 
 @dataclass
 class TechContext:
     """技术上下文
-    
+
     通过 Context7 MCP 获取的技术栈相关信息。
     """
     library_name: str
-    relevant_docs: List[str] = field(default_factory=list)
-    best_practices: List[str] = field(default_factory=list)
-    common_pitfalls: List[str] = field(default_factory=list)
+    relevant_docs: list[str] = field(default_factory=list)
+    best_practices: list[str] = field(default_factory=list)
+    common_pitfalls: list[str] = field(default_factory=list)
 
 
 ISSUE_TYPES = {
@@ -158,9 +157,9 @@ class DocReviewAgent:
     def __init__(
         self,
         llm: BaseChatModel,
-        sequential_thinking: Optional[SequentialThinkingClient] = None,
+        sequential_thinking: SequentialThinkingClient | None = None,
         context7: Any = None,
-        tools: Optional[List[BaseTool]] = None,
+        tools: list[BaseTool] | None = None,
         decision_engine: Any = None,
     ) -> None:
         """初始化 DocReview Agent
@@ -186,53 +185,53 @@ class DocReviewAgent:
 
     async def review(self, state: AgentState) -> AgentState:
         """执行完整的六步审查流程
-        
+
         主要入口方法，执行完整的多步审查并更新状态。
-        
+
         Args:
             state: 当前工作流状态
-            
+
         Returns:
             更新后的状态，包含 review_reports 和 review_conclusion_data
         """
         spec = state.get("specification", "")
         iteration = state.get("iteration_count", 0) + 1
-        
+
         self.logger.info(f"DocReview: 开始第 {iteration} 轮审查")
-        
+
         # §11.3：本轮自建**局部** tracker。刻意不放 self 上——Agent 实例在
         # workflow 生命周期内复用，挂实例字段会让两次并发审查互相污染成本。
         local_tracker = CostTracker()
 
         try:
             core_loop = await self._extract_core_loop(spec, tracker=local_tracker)
-            
+
             consistency_issues = await self._check_consistency(
                 spec, core_loop, tracker=local_tracker
             )
-            
+
             tech_context = await self._enrich_context(spec)
-            
+
             atomize_issues, atomic_reqs = await self._atomize_requirements(
                 spec, core_loop, tracker=local_tracker
             )
-            
+
             feasibility_issues, dep_graph = await self._deduce_feasibility(
                 spec, atomic_reqs, tech_context, tracker=local_tracker
             )
-            
+
             risk_issues = await self._detect_risks(
                 spec, dep_graph,
                 consistency_issues + atomize_issues + feasibility_issues,
                 tracker=local_tracker,
             )
-            
+
             exec_issues = await self._review_executability(
                 spec,
                 consistency_issues + atomize_issues + feasibility_issues + risk_issues,
                 tracker=local_tracker,
             )
-            
+
             all_issues = (
                 consistency_issues
                 + atomize_issues
@@ -248,13 +247,10 @@ class DocReviewAgent:
 
             # 决策层五原语：只写 laya_findings / laya_trace，不改业务字段（§8.1）。
             # 放在 ID 分配之后——verify_issues/verify_resolutions 按 issue_id 关联快照。
-            # 放在 Markdown 编译之前：审计链要能引用最终报告同一批 ID。
             await self._run_decision_layer(state, spec, all_issues, iteration)
-            
-            markdown_report = self._compile_markdown_report(all_issues, iteration)
-            
+
             structured_conclusion = self._compile_structured_conclusion(all_issues, spec)
-            
+
             review_report: ReviewReport = {
                 "iteration": iteration,
                 "timestamp": self._get_timestamp(),
@@ -265,19 +261,19 @@ class DocReviewAgent:
                 "open_questions": self._extract_open_questions(all_issues),
                 "next_steps": self._generate_next_steps(structured_conclusion),
             }
-            
+
             state["review_reports"].append(review_report)
             state["review_conclusion_data"] = structured_conclusion.model_dump(by_alias=False)
             state["review_conclusion"] = structured_conclusion.review_conclusion
             state["iteration_count"] = iteration
-            
+
             self.logger.info(
                 f"审查完成: conclusion={structured_conclusion.review_conclusion}, "
                 f"issues={len(all_issues)}"
             )
-            
+
             return state
-            
+
         except Exception as e:
             self.logger.error(f"审查过程出错: {e}")
             state["error_code"] = "DOCREVIEW_ERR_SYS_001"
@@ -294,7 +290,7 @@ class DocReviewAgent:
                 state["total_llm_cost"] = (
                     state.get("total_llm_cost", 0.0) + local_tracker.total_cost
                 )
-    
+
     # ── 决策层节点与原语分流（T-17b / §13.1）─────────────────────────
     # screen/assess 作用于**文档**本身，不依赖任何一轮的 issue 快照，故各占一个
     # 图节点；verify_issues/verify_resolutions/judge_convergence 要读上一轮与本轮
@@ -470,9 +466,9 @@ class DocReviewAgent:
         tracker: CostTracker | None = None,
     ) -> str:
         """通过 Sequential Thinking MCP 进行多步推理
-        
+
         使用 MCP 进行结构化推理，当 MCP 不可用时降级为纯 LLM 推理。
-        
+
         Args:
             step_name: 步骤名称
             context: 上下文内容
@@ -485,7 +481,7 @@ class DocReviewAgent:
         """
         if not self.sequential_thinking or self.sequential_thinking.is_degraded:
             return await self._llm_think(step_name, context, tracker)
-        
+
         try:
             thoughts = []
             for i in range(num_thoughts):
@@ -496,13 +492,13 @@ class DocReviewAgent:
                     next_thought_needed=i < num_thoughts - 1,
                 )
                 thoughts.append(result.step.thought)
-            
+
             return "\n".join(thoughts)
-            
+
         except Exception as e:
             self.logger.warning(f"Sequential Thinking 调用失败，降级为纯 LLM: {e}")
             return await self._llm_think(step_name, context, tracker)
-    
+
     async def _llm_think(
         self,
         step_name: str,
@@ -510,12 +506,12 @@ class DocReviewAgent:
         tracker: CostTracker | None = None,
     ) -> str:
         """纯 LLM 推理（降级模式）
-        
+
         Args:
             step_name: 步骤名称
             context: 上下文内容
             tracker: 局部成本追踪器（§11.3），由 review() 自建并逐层传入
-            
+
         Returns:
             LLM 生成的推理结果
         """
@@ -532,8 +528,8 @@ class DocReviewAgent:
             model=resolve_cost_model(),
         )
         return response.generations[0][0].text.strip()
-    
-    async def _enrich_context(self, spec: str) -> Optional[TechContext]:
+
+    async def _enrich_context(self, spec: str) -> TechContext | None:
         """从规格文档提取技术上下文（纯文本分析，不依赖外部服务）
 
         Args:
@@ -552,13 +548,13 @@ class DocReviewAgent:
             best_practices=[],
             common_pitfalls=[],
         )
-    
+
     def _extract_tech_stack(self, spec: str) -> str:
         """从规格文档提取技术栈
-        
+
         Args:
             spec: 规格文档内容
-            
+
         Returns:
             技术栈名称，未找到时返回空字符串
         """
@@ -568,13 +564,13 @@ class DocReviewAgent:
             r"技术要求[：:]\s*(.+)",
             r"\b(Python|Node\.js|React|Vue|Go|Rust|Java|TypeScript)\b",
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, spec, re.IGNORECASE)
             if match:
                 return match.group(1).strip() if len(match.groups()) > 0 else match.group(0)
         return ""
-    
+
 
     async def _extract_core_loop(
         self,
@@ -582,211 +578,211 @@ class DocReviewAgent:
         tracker: CostTracker | None = None,
     ) -> CoreLoopAnalysis:
         """步骤 1：核心闭环提取
-        
+
         识别规格文档中的主业务流程、入口点、出口点和潜在断点。
-        
+
         Args:
             spec: 规格文档内容
-            
+
         Returns:
             核心闭环分析结果
         """
         self.logger.debug("步骤 1：核心闭环提取")
-        
+
         thinking_result = await self._think_step(
             "core_loop_extraction",
             f"分析以下规格文档的核心业务流程和闭环完整性：\n\n{spec}",
             tracker=tracker,
         )
-        
+
         flows = self._extract_list_from_text(thinking_result, ["流程", "process", "flow"])
         breaks = self._extract_list_from_text(thinking_result, ["缺失", "break", "gap"])
-        
+
         return CoreLoopAnalysis(
             flows=flows[:5],
             breaks=breaks[:5],
             entry_points=["用户发起请求"],
             exit_points=["任务完成"],
         )
-    
+
     async def _check_consistency(
         self,
         spec: str,
         core_loop: CoreLoopAnalysis,
         tracker: CostTracker | None = None,
-    ) -> List[IssueStatus]:
+    ) -> list[IssueStatus]:
         """步骤 2：一致性检查
-        
+
         检查文档内部逻辑、术语、数据的一致性。
-        
+
         Args:
             spec: 规格文档内容
             core_loop: 核心闭环分析结果
-            
+
         Returns:
             发现的一致性问题列表
         """
         self.logger.debug("步骤 2：一致性检查")
-        
+
         thinking_result = await self._think_step(
             "consistency_check",
             f"检查以下规格的一致性问题：\n\n{spec}\n\n核心闭环：{core_loop.flows}",
             tracker=tracker,
         )
-        
+
         issues = self._parse_issues_from_text(
             thinking_result,
             expected_types=[ISSUE_TYPES["CONSISTENCY"]],
             default_severity=SEVERITY_MEDIUM,
         )
-        
+
         return issues
-    
+
     async def _atomize_requirements(
         self,
         spec: str,
         core_loop: CoreLoopAnalysis,
         tracker: CostTracker | None = None,
-    ) -> Tuple[List[IssueStatus], List[AtomicRequirement]]:
+    ) -> tuple[list[IssueStatus], list[AtomicRequirement]]:
         """步骤 3：需求原子化
-        
+
         将需求分解为可独立验证的原子单元，并识别完整性问题。
-        
+
         Args:
             spec: 规格文档内容
             core_loop: 核心闭环分析结果
-            
+
         Returns:
             (完整性问题列表, 原子化需求列表)
         """
         self.logger.debug("步骤 3：需求原子化")
-        
+
         thinking_result = await self._think_step(
             "requirement_atomization",
             f"分析以下规格的需求完整性和原子化程度：\n\n{spec}\n\n核心闭环：{core_loop.flows}",
             tracker=tracker,
         )
-        
+
         issues = self._parse_issues_from_text(
             thinking_result,
             expected_types=[ISSUE_TYPES["REQUIREMENT_INCOMPLETE"]],
             default_severity=SEVERITY_MEDIUM,
         )
-        
+
         atomic_reqs = self._parse_atomic_requirements(thinking_result)
-        
+
         return issues, atomic_reqs
-    
+
     async def _deduce_feasibility(
         self,
         spec: str,
-        atomic_reqs: List[AtomicRequirement],
-        context: Optional[TechContext],
+        atomic_reqs: list[AtomicRequirement],
+        context: TechContext | None,
         tracker: CostTracker | None = None,
-    ) -> Tuple[List[IssueStatus], Dict[str, Any]]:
+    ) -> tuple[list[IssueStatus], dict[str, Any]]:
         """步骤 4：技术可行性推导
-        
+
         评估技术方案的可行性和依赖关系。
-        
+
         Args:
             spec: 规格文档内容
             atomic_reqs: 原子化需求列表
             context: 技术上下文
-            
+
         Returns:
             (可行性问题列表, 依赖关系图)
         """
         self.logger.debug("步骤 4：技术可行性推导")
-        
+
         context_str = f"\n技术上下文：{context}" if context else ""
-        
+
         thinking_result = await self._think_step(
             "feasibility_deduction",
             f"分析以下规格的技术可行性和依赖关系：\n\n{spec}{context_str}",
             tracker=tracker,
         )
-        
+
         issues = self._parse_issues_from_text(
             thinking_result,
             expected_types=[ISSUE_TYPES["FEASIBILITY"]],
             default_severity=SEVERITY_HIGH,
         )
-        
+
         dep_graph = self._parse_dependency_graph(thinking_result)
-        
+
         return issues, dep_graph
-    
+
     async def _detect_risks(
         self,
         spec: str,
-        dep_graph: Dict[str, Any],
-        prev_issues: List[IssueStatus],
+        dep_graph: dict[str, Any],
+        prev_issues: list[IssueStatus],
         tracker: CostTracker | None = None,
-    ) -> List[IssueStatus]:
+    ) -> list[IssueStatus]:
         """步骤 5：风险检测
-        
+
         识别技术、业务、依赖关系等方面的潜在风险。
-        
+
         Args:
             spec: 规格文档内容
             dep_graph: 依赖关系图
             prev_issues: 之前发现的问题
-            
+
         Returns:
             发现的风险列表
         """
         self.logger.debug("步骤 5：风险检测")
-        
+
         thinking_result = await self._think_step(
             "risk_detection",
             f"识别以下规格的潜在风险：\n\n{spec}\n\n依赖关系：{dep_graph}\n\n已知问题：{prev_issues}",
             tracker=tracker,
         )
-        
+
         issues = self._parse_issues_from_text(
             thinking_result,
             expected_types=[ISSUE_TYPES["RISK"]],
             default_severity=SEVERITY_MEDIUM,
         )
-        
+
         return issues
-    
+
     async def _review_executability(
         self,
         spec: str,
-        all_issues: List[IssueStatus],
+        all_issues: list[IssueStatus],
         tracker: CostTracker | None = None,
-    ) -> List[IssueStatus]:
+    ) -> list[IssueStatus]:
         """步骤 6：可执行性审查
-        
+
         从开发者视角评估文档的可执行性。
-        
+
         Args:
             spec: 规格文档内容
             all_issues: 所有已知问题
-            
+
         Returns:
             可执行性问题列表
         """
         self.logger.debug("步骤 6：可执行性审查")
-        
+
         thinking_result = await self._think_step(
             "executability_review",
             f"从开发者视角审查以下规格的可执行性：\n\n{spec}\n\n已知问题：{all_issues}",
             tracker=tracker,
         )
-        
+
         issues = self._parse_issues_from_text(
             thinking_result,
             expected_types=[ISSUE_TYPES["EXECUTABILITY"]],
             default_severity=SEVERITY_MEDIUM,
         )
-        
+
         return issues
-    
+
     def _compile_markdown_report(
         self,
-        issues: List[IssueStatus],
+        issues: list[IssueStatus],
         iteration: int,
     ) -> str:
         """生成 Markdown 格式的审查报告
@@ -806,16 +802,16 @@ class DocReviewAgent:
             issues,
             key=lambda x: SEVERITY_ORDER.get(x["severity"], 99),
         )
-        
+
         report_lines = [
             "## DocReview Review Report",
-            f"**Review Conclusion**: [待评估]",
+            "**Review Conclusion**: [待评估]",
             f"**Review Summary**: 本轮审查发现 {len(issues)} 个问题",
             "",
             "### List of Issues Found",
             "",
         ]
-        
+
         for issue in sorted_issues:
             report_lines.extend([
                 f"- **{issue['issue_id']}**",
@@ -826,26 +822,26 @@ class DocReviewAgent:
                 f"  - **Relevant Location**: {issue['location']}",
                 "",
             ])
-        
+
         return "\n".join(report_lines)
-    
+
     def _compile_structured_conclusion(
         self,
-        issues: List[IssueStatus],
+        issues: list[IssueStatus],
         spec: str,
     ) -> ReviewConclusion:
         """生成结构化审查结论
-        
+
         判定规则（严格优先级）：
         1. 存在 Blocking 问题 ≥ 1 → Fail
         2. AC 覆盖率不完整（P0 FR 未全部被 AC 覆盖）→ Fail
         3. 无 Blocking 但存在 High 问题 ≥ 1 → Conditional Pass
         4. 仅有 Medium/Low 问题或零问题 → Pass
-        
+
         Args:
             issues: 问题列表
             spec: 规格文档内容
-            
+
         Returns:
             结构化审查结论
         """
@@ -853,16 +849,16 @@ class DocReviewAgent:
         high_count = sum(1 for i in issues if i["severity"] == SEVERITY_HIGH)
         medium_count = sum(1 for i in issues if i["severity"] == SEVERITY_MEDIUM)
         low_count = sum(1 for i in issues if i["severity"] == SEVERITY_LOW)
-        
+
         ac_coverage_complete = self._check_ac_coverage(spec, issues)
-        
+
         if blocking_count > 0 or not ac_coverage_complete:
             conclusion = "Fail"
         elif high_count > 0:
             conclusion = "Conditional Pass"
         else:
             conclusion = "Pass"
-        
+
         return ReviewConclusion(
             review_conclusion=conclusion,
             blocking_count=blocking_count,
@@ -871,8 +867,8 @@ class DocReviewAgent:
             low_count=low_count,
             ac_coverage_complete=ac_coverage_complete,
         )
-    
-    def _check_ac_coverage(self, spec: str, issues: List[IssueStatus]) -> bool:
+
+    def _check_ac_coverage(self, spec: str, issues: list[IssueStatus]) -> bool:
         """检查 AC 覆盖率（支持 6 种格式变体）
 
         验证 P0 功能需求是否被验收标准覆盖。
@@ -920,13 +916,13 @@ class DocReviewAgent:
             return False
 
         return p0_frs.issubset(ac_frs) if ac_frs else bool(ac_matches)
-    
+
     def _parse_issues_from_text(
         self,
         text: str,
-        expected_types: List[str],
+        expected_types: list[str],
         default_severity: str,
-    ) -> List[IssueStatus]:
+    ) -> list[IssueStatus]:
         """从文本中解析问题列表（双路径策略 + 质量门控）
 
         优先解析 [ISSUE] 结构化格式，降级到宽松模式匹配。
@@ -951,7 +947,7 @@ class DocReviewAgent:
 
         return issues
 
-    def _parse_structured_issues(self, text: str) -> List[IssueStatus]:
+    def _parse_structured_issues(self, text: str) -> list[IssueStatus]:
         """解析 [ISSUE] 结构化格式"""
         pattern = r"\[ISSUE\]\s*type=(\S+)\s*severity=(\S+)\s*description=(.+?)\s*location=(.+?)\s*suggestion=(.+?)(?:\n|$)"
         matches = re.findall(pattern, text, re.IGNORECASE)
@@ -971,9 +967,9 @@ class DocReviewAgent:
     def _parse_loose_issues(
         self,
         text: str,
-        expected_types: List[str],
+        expected_types: list[str],
         default_severity: str,
-    ) -> List[IssueStatus]:
+    ) -> list[IssueStatus]:
         """降级：宽松模式匹配"""
         issues = []
         patterns = [
@@ -995,7 +991,7 @@ class DocReviewAgent:
                 ))
         return issues
 
-    def _parse_atomic_requirements(self, text: str) -> List[AtomicRequirement]:
+    def _parse_atomic_requirements(self, text: str) -> list[AtomicRequirement]:
         """从文本中解析原子化需求（[FR-N] 格式 + 宽松匹配）
 
         Args:
@@ -1024,7 +1020,7 @@ class DocReviewAgent:
                 ))
         return reqs
 
-    def _parse_dependency_graph(self, text: str) -> Dict[str, Any]:
+    def _parse_dependency_graph(self, text: str) -> dict[str, Any]:
         """从文本中解析依赖关系图（[DEP] 格式 + 宽松匹配）
 
         Args:
@@ -1048,14 +1044,14 @@ class DocReviewAgent:
                 nodes.add(dep)
                 edges.append({"from": "unknown", "to": dep})
         return {"nodes": list(nodes), "edges": edges}
-    
-    def _extract_list_from_text(self, text: str, keywords: List[str]) -> List[str]:
+
+    def _extract_list_from_text(self, text: str, keywords: list[str]) -> list[str]:
         """从文本中提取包含关键词的行
-        
+
         Args:
             text: 输入文本
             keywords: 关键词列表
-            
+
         Returns:
             匹配的行列表
         """
@@ -1067,47 +1063,47 @@ class DocReviewAgent:
                 if cleaned:
                     result.append(cleaned)
         return result
-    
+
     def _extract_highlights(
         self,
         spec: str,
-        issues: List[IssueStatus],
-    ) -> List[str]:
+        issues: list[IssueStatus],
+    ) -> list[str]:
         """提取文档亮点
-        
+
         识别文档中的优点和良好实践。
-        
+
         Args:
             spec: 规格文档内容
             issues: 问题列表
-            
+
         Returns:
             亮点列表
         """
         highlights = []
-        
+
         if "# " in spec and "## " in spec:
             highlights.append("文档结构清晰，章节层次分明")
-        
+
         if "验收标准" in spec or "Acceptance Criteria" in spec:
             highlights.append("包含完整的验收标准")
-        
+
         if "**FR-" in spec and "**AC-" in spec:
             highlights.append("具有可追溯的需求和验收标准编号")
-        
+
         if "背景" in spec or "Background" in spec:
             highlights.append("包含背景说明")
-        
+
         return highlights
-    
-    def _extract_open_questions(self, issues: List[IssueStatus]) -> List[str]:
+
+    def _extract_open_questions(self, issues: list[IssueStatus]) -> list[str]:
         """提取开放问题
-        
+
         从问题列表中识别需要进一步澄清的问题。
-        
+
         Args:
             issues: 问题列表
-            
+
         Returns:
             开放问题列表
         """
@@ -1116,13 +1112,13 @@ class DocReviewAgent:
             if "?" in issue["description"] or "待定" in issue["description"]:
                 open_qs.append(issue["description"][:100])
         return open_qs
-    
+
     def _generate_summary(self, conclusion: ReviewConclusion) -> str:
         """生成审查摘要
-        
+
         Args:
             conclusion: 审查结论
-            
+
         Returns:
             摘要字符串
         """
@@ -1134,15 +1130,15 @@ class DocReviewAgent:
         )
         total = conclusion.blocking_count + conclusion.high_count + conclusion.medium_count + conclusion.low_count
         return f"审查发现 {total} 个问题 ({counts})"
-    
+
     def _generate_next_steps(self, conclusion: ReviewConclusion) -> str:
         """生成下一步建议
-        
+
         根据审查结论提供后续行动建议。
-        
+
         Args:
             conclusion: 审查结论
-            
+
         Returns:
             下一步建议
         """
@@ -1152,11 +1148,11 @@ class DocReviewAgent:
             return "请确认是否接受有条件通过"
         else:
             return "规格文档审查通过，可进入执行阶段"
-    
+
     def _get_timestamp(self) -> str:
         """获取当前时间戳
-        
+
         Returns:
             ISO 格式的时间戳字符串
         """
-        return datetime.now().isoformat()
+        return datetime.now(UTC).isoformat()

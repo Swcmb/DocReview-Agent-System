@@ -3,13 +3,13 @@
 import pytest
 
 from src.utils.llm import (
-    CostTracker,
     LLM_PRICING,
+    CostTracker,
+    _extract_tokens,
     check_budget,
     invoke_with_cost,
     resolve_cost_model,
     track_llm_cost,
-    _extract_tokens,
 )
 
 
@@ -238,7 +238,7 @@ class TestLLMPricing:
 
     def test_pricing_format(self):
         """测试定价格式 / Test Pricing Format"""
-        for model, (prompt_price, completion_price) in LLM_PRICING.items():
+        for _model, (prompt_price, completion_price) in LLM_PRICING.items():
             assert prompt_price > 0
             assert completion_price > 0
             assert isinstance(prompt_price, float)

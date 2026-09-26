@@ -3,8 +3,8 @@
 提供文档审查系统的核心智能体实现。
 """
 
-from .supervisor import SupervisorAgent
 from .docreview import DocReviewAgent
+from .supervisor import SupervisorAgent
 
 __all__ = [
     "SupervisorAgent",

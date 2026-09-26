@@ -3,11 +3,10 @@
 Context7 MCP Server: 官方 Node.js 包
 """
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
-from .base import BaseMCPClient, MCPError, MCPTimeoutError
+
+from .base import BaseMCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -17,23 +16,23 @@ class DocResult:
     library_id: str
     library_name: str
     snippet: str
-    url: Optional[str] = None
+    url: str | None = None
 
 @dataclass
 class ContextResult:
     """上下文结果"""
     topic: str
     content: str
-    sources: List[str]
+    sources: list[str]
 
 class Context7Client(BaseMCPClient):
     """Context7 MCP 客户端
-    
+
     用于解析库标识符和查询文档。
     """
-    
+
     SERVER_PACKAGE = "@context7/mcpserver"
-    
+
     def __init__(
         self,
         timeout: int = 30,
@@ -41,8 +40,8 @@ class Context7Client(BaseMCPClient):
     ):
         super().__init__(timeout, max_retries)
         self._connected = False
-        self._cached_library_ids: Dict[str, str] = {}
-    
+        self._cached_library_ids: dict[str, str] = {}
+
     async def start(self) -> bool:
         """启动 Context7 MCP 服务"""
         try:
@@ -53,11 +52,11 @@ class Context7Client(BaseMCPClient):
                 stderr=asyncio.subprocess.PIPE
             )
             await asyncio.wait_for(proc.communicate(), timeout=10)
-            
+
             self._connected = True
             self.logger.info("Context7 MCP 客户端已初始化（本地模式）")
             return True
-            
+
         except FileNotFoundError:
             self.logger.warning("npm 未找到，Context7 将使用本地解析模式")
             self._degraded = True
@@ -66,34 +65,34 @@ class Context7Client(BaseMCPClient):
             self.logger.error(f"启动 Context7 MCP 客户端失败: {e}")
             self._degraded = True
             return False
-    
+
     async def stop(self) -> None:
         """停止 MCP 服务"""
         self._connected = False
         await self._cleanup_all()
         self.logger.info("Context7 MCP 客户端已停止")
-    
+
     async def health_check(self) -> bool:
         """健康检查"""
         if self._degraded:
             return False
         return self._connected
-    
+
     async def resolve_library_id(self, name: str) -> str:
         """解析库标识符
-        
+
         Args:
             name: 库/框架名称（如 "LangChain", "React", "Next.js"）
-            
+
         Returns:
             Context7 兼容的库标识符（如 "/langchain/langchain"）
         """
         # 缓存查询
         if name in self._cached_library_ids:
             return self._cached_library_ids[name]
-        
+
         # 常见库的映射
-        LIBRARY_MAPPING = {
+        library_mapping = {
             "langchain": "/langchain/langchain",
             "openai": "/openai/openai-node",
             "anthropic": "/anthropics/anthropic-sdk-python",
@@ -114,56 +113,56 @@ class Context7Client(BaseMCPClient):
             "docker": "/moby/moby",
             "kubernetes": "/kubernetes/kubernetes",
         }
-        
+
         normalized = name.lower().strip()
-        
-        if normalized in LIBRARY_MAPPING:
-            library_id = LIBRARY_MAPPING[normalized]
+
+        if normalized in library_mapping:
+            library_id = library_mapping[normalized]
         else:
             # 尝试使用模糊匹配
             library_id = f"/{normalized.replace(' ', '-')}/{name.lower().replace(' ', '-')}"
-        
+
         self._cached_library_ids[name] = library_id
         return library_id
-    
+
     async def query_docs(
         self,
         query: str,
-        library_id: Optional[str] = None,
+        library_id: str | None = None,
         num_results: int = 5
-    ) -> List[DocResult]:
+    ) -> list[DocResult]:
         """查询文档（当前为降级模式，返回空结果）
 
         Context7 MCP 集成已移除，此方法仅记录降级日志并返回空列表。
         """
         self.logger.debug(f"Context7 处于降级模式，跳过查询: {query}")
         return []
-    
+
     async def get_context(self, topic: str) -> ContextResult:
         """获取上下文信息
-        
+
         Args:
             topic: 主题
-            
+
         Returns:
             ContextResult: 上下文结果
         """
         # 尝试解析库名
         library_id = await self.resolve_library_id(topic)
-        
+
         # 查询相关文档
         docs = await self.query_docs(topic, library_id, num_results=3)
-        
+
         content = "\n\n".join([
             f"- {doc.snippet}"
             for doc in docs
         ])
-        
+
         sources = [
             doc.url for doc in docs
             if doc.url
         ]
-        
+
         return ContextResult(
             topic=topic,
             content=content or f"关于 '{topic}' 的上下文信息（离线模式）",

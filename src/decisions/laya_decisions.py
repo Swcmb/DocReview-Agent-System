@@ -49,6 +49,7 @@ from src.decisions.factory import await_thread
 from src.decisions.laya_adapter import (
     AdapterError,
     BatchItem,
+    BatchPlan,
     act_allowed,
     act_refusal_reason,
     build_requests,
@@ -295,7 +296,11 @@ class LayaDecisionEngine:
         """对单条 raw answer 门控并生成 audit（§8.2 + §8.3）。"""
         # guard 原语（screen）的 question 不在冻结契约内（§5.2：guard 的 noul 无
         # criteria 键，来自 Laya preset），故先查冻结契约、再回落注入的 guard 表。
-        question = FROZEN_BUSINESS_QUESTIONS.get(primitive, {}).get(question_id)
+        # 两处来源类型不同（冻结契约给 dict、注入的 guard 表给 Mapping），
+        # 显式声明为共同父类型，避免把第一个来源的具体类型当成变量类型。
+        question: Mapping[str, Any] | None = FROZEN_BUSINESS_QUESTIONS.get(primitive, {}).get(
+            question_id
+        )
         if question is None:
             question = self._guard_questions.get(question_id)
         shape = str((question or {}).get("type", ""))
@@ -380,7 +385,7 @@ class LayaDecisionEngine:
             "threshold_set": _threshold_set_of(thresholds),
             "calibration_id": self._provenance.calibration_id,
             "calibration_manifest_sha256": self._provenance.calibration_manifest_sha256,
-            "status": status,  # type: ignore[typeddict-item]
+            "status": status,
             "route_action": route_action,
             "value": value,
             "usage": {},
@@ -471,14 +476,18 @@ class LayaDecisionEngine:
                 )
             raise
 
-        plan_for_index = {}
+        plan_for_index: dict[int, BatchPlan] = {}
         for plan in plans:
             for idx in plan["item_indexes"]:
                 plan_for_index[idx] = plan
 
         gated: list[GatedAnswer] = []
         for (i, qid, _question, state), answer in zip(flat, answers, strict=False):
-            plan = plan_for_index.get(i, {})
+            # 每个 flat 下标都来自同一批 batch_items，理论必有 plan；下面的空 dict
+            # 只是防御性兜底。cast 保留原有兜底行为，同时不谎称 {} 是合法 BatchPlan。
+            # 用 found 中转：plan 已被上面的 for 绑定为 BatchPlan，不能再接 None。
+            found = plan_for_index.get(i)
+            plan = found if found is not None else cast("BatchPlan", {})
             gated.append(
                 self._gated(
                     primitive,

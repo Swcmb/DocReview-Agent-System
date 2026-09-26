@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.tools.terminal import TerminalTool, CommandResult
+from src.tools.terminal import CommandResult, TerminalTool
 
 
 @pytest.fixture

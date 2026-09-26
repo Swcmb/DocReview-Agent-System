@@ -4,25 +4,23 @@ from typing import cast
 
 import pytest
 
-from src.workflows.review_workflow import (
-    build_workflow,
-    create_workflow_runtime,
-    initialize,
-    load_document,
-    evaluate_result,
-    finalize,
-    route_after_initialize,
-    route_after_evaluate,
-    route_after_approval,
-    _is_stagnant,
-    _prune_review_history,
-    _save_review_history,
-    _print_summary,
-)
 from src.schemas.models import AgentState
 from src.state.agent_state import create_initial_state
 from src.utils.llm import CostTracker
 from src.workflows.review_routing import BUDGET_ERROR_CODE
+from src.workflows.review_workflow import (
+    _is_stagnant,
+    _print_summary,
+    _prune_review_history,
+    _save_review_history,
+    evaluate_result,
+    finalize,
+    initialize,
+    load_document,
+    route_after_approval,
+    route_after_evaluate,
+    route_after_initialize,
+)
 
 
 @pytest.fixture
@@ -402,14 +400,13 @@ async def test_initialize_mcp_degraded():
 async def test_load_document_empty_path():
     """测试 load_document 空路径"""
     state = {"document_path": ""}
-    result = await load_document(state)
+    await load_document(state)
     assert state.get("error_code") == "DOCREVIEW_ERR_DOC_001"
 
 
 @pytest.mark.asyncio
 async def test_load_document_success(temp_dir):
     """测试 load_document 成功加载"""
-    from pathlib import Path
     from src.tools.reading import ReadingTool
     test_file = temp_dir / "test.md"
     test_file.write_text("# Test Document")
@@ -580,7 +577,6 @@ def test_print_summary(capsys):
 
 def test_save_review_history(temp_dir, monkeypatch):
     """测试审查历史保存"""
-    import os
     monkeypatch.chdir(temp_dir)
 
     state = {

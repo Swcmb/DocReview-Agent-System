@@ -29,7 +29,6 @@
    }
 """
 
-import sys
 
 from src.mcp_server.stdio_server import main
 

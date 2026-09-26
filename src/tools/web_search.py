@@ -10,7 +10,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import List, Optional
 
 from src.tools.base import BaseTool, ToolResult
 
@@ -29,8 +28,8 @@ class ApiValidationResult:
     api_name: str
     available: bool
     response_time_ms: float
-    status_code: Optional[int]
-    error: Optional[str]
+    status_code: int | None
+    error: str | None
 
 
 class WebSearchTool(BaseTool):
@@ -104,7 +103,7 @@ class WebSearchTool(BaseTool):
             self.logger.error(f"搜索失败: {e}")
             return self._create_error_result(f"搜索失败: {str(e)}")
 
-    def _duckduckgo_search(self, query: str, num_results: int) -> List[SearchResult]:
+    def _duckduckgo_search(self, query: str, num_results: int) -> list[SearchResult]:
         """使用 DuckDuckGo HTML 搜索（无需 API key）/ DuckDuckGo HTML Search
 
         Args:
@@ -134,7 +133,7 @@ class WebSearchTool(BaseTool):
         snippet_matches = re.findall(snippet_pattern, html)
         snippets_dict = {m[0]: m[1] for m in snippet_matches}
 
-        for i, (url, title) in enumerate(matches[:num_results]):
+        for url, title in matches[:num_results]:
             snippet = snippets_dict.get(url, "")
             results.append(SearchResult(title=title, url=url, snippet=snippet))
 

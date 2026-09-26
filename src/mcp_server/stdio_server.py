@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -38,23 +38,23 @@ logging.basicConfig(
 logger = logging.getLogger("docreview-mcp-stdio")
 
 # 存储运行时上下文
-_runtime_cache: Optional[Dict[str, Any]] = None
+_runtime_cache: dict[str, Any] | None = None
 
 
 class ReviewRequest(BaseModel):
     """文档审查请求"""
-    doc_path: Optional[str] = Field(default=None, description="待审查文档路径")
-    task: Optional[str] = Field(default=None, description="任务描述")
+    doc_path: str | None = Field(default=None, description="待审查文档路径")
+    task: str | None = Field(default=None, description="任务描述")
     max_iterations: int = Field(default=10, description="最大审查迭代次数")
 
 
 class SpecGenerateRequest(BaseModel):
     """规格生成请求"""
     task: str = Field(description="任务描述")
-    document_content: Optional[str] = Field(default=None, description="参考文档内容")
+    document_content: str | None = Field(default=None, description="参考文档内容")
 
 
-async def _get_runtime() -> Dict[str, Any]:
+async def _get_runtime() -> dict[str, Any]:
     """获取或初始化工作流运行时"""
     global _runtime_cache
     if _runtime_cache is None:
@@ -62,7 +62,7 @@ async def _get_runtime() -> Dict[str, Any]:
     return _runtime_cache
 
 
-async def list_tools() -> Dict[str, Any]:
+async def list_tools() -> dict[str, Any]:
     """列出所有可用工具（符合 MCP 协议规范）"""
     tools = [
         {
@@ -106,31 +106,31 @@ async def list_tools() -> Dict[str, Any]:
     return {"tools": tools}
 
 
-async def review_document(doc_path: Optional[str] = None, task: Optional[str] = None, max_iterations: int = 10) -> Dict[str, Any]:
+async def review_document(doc_path: str | None = None, task: str | None = None, max_iterations: int = 10) -> dict[str, Any]:
     """执行文档审查"""
     try:
         logger.info(f"执行文档审查: doc_path={doc_path}, task={task}")
-        
+
         initial_state = {
             "user_task": task or "",
             "document_path": doc_path,
             "max_iterations": max_iterations
         }
-        
+
         result = await run_review_workflow(initial_state)
-        
+
         issues = []
         reports = []
         for report in result.get("review_reports", []):
             reports.append(report)
             issues.extend(report.get("issues", []))
-        
+
         summary = f"审查完成！共发现 {len(issues)} 个问题"
         if issues:
             summary += ":\n" + "\n".join([f"- {issue.get('description', '')}" for issue in issues[:5]])
             if len(issues) > 5:
                 summary += f"\n...（还有 {len(issues) - 5} 个问题）"
-        
+
         return {
             "content": [
                 {
@@ -147,7 +147,7 @@ async def review_document(doc_path: Optional[str] = None, task: Optional[str] = 
                 "reports": reports
             }
         }
-    
+
     except Exception as e:
         logger.error(f"审查失败: {e}", exc_info=True)
         return {
@@ -164,24 +164,24 @@ async def review_document(doc_path: Optional[str] = None, task: Optional[str] = 
         }
 
 
-async def generate_spec(task: str, document_content: Optional[str] = None) -> Dict[str, Any]:
+async def generate_spec(task: str, document_content: str | None = None) -> dict[str, Any]:
     """生成规格文档"""
     try:
         logger.info(f"生成规格文档: task={task[:50]}...")
-        
+
         initial_state = {
             "user_task": task,
             "document_content": document_content or "",
             "max_iterations": 1
         }
-        
+
         runtime = await _get_runtime()
         supervisor = runtime["supervisor"]
-        
+
         state = await supervisor.generate_spec(initial_state)
-        
+
         specification = state.get("specification", "")
-        
+
         return {
             "content": [
                 {
@@ -194,7 +194,7 @@ async def generate_spec(task: str, document_content: Optional[str] = None) -> Di
                 "spec_version": state.get("spec_version", 1)
             }
         }
-    
+
     except Exception as e:
         logger.error(f"规格生成失败: {e}", exc_info=True)
         return {
@@ -211,7 +211,7 @@ async def generate_spec(task: str, document_content: Optional[str] = None) -> Di
         }
 
 
-async def health_check() -> Dict[str, Any]:
+async def health_check() -> dict[str, Any]:
     """健康检查"""
     try:
         runtime = await _get_runtime()
@@ -220,7 +220,7 @@ async def health_check() -> Dict[str, Any]:
             "sequential_thinking": not runtime.get("seq_thinking", {}).is_degraded if hasattr(runtime.get("seq_thinking"), "is_degraded") else False,
             "context7": not runtime.get("context7", {}).is_degraded if hasattr(runtime.get("context7"), "is_degraded") else False
         }
-        
+
         status_text = "服务正常运行"
         return {
             "content": [
@@ -253,7 +253,7 @@ async def health_check() -> Dict[str, Any]:
         }
 
 
-async def invoke_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+async def invoke_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """调用工具"""
     if tool_name == "review_document":
         return await review_document(**arguments)
@@ -276,14 +276,14 @@ async def invoke_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, An
         }
 
 
-async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
+async def process_request(request: dict[str, Any]) -> dict[str, Any]:
     """处理单个请求（符合 MCP 协议规范）"""
     request_id = request.get("id")
     method = request.get("method")
     params = request.get("params", {})
-    
+
     logger.debug(f"收到请求: id={request_id}, method={method}")
-    
+
     try:
         if method == "initialize":
             """初始化连接 - MCP 客户端在连接时调用"""
@@ -303,7 +303,7 @@ async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 }
             }
-        
+
         elif method == "tools/list":
             """列出可用工具"""
             result = await list_tools()
@@ -312,33 +312,33 @@ async def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 "id": request_id,
                 "result": result
             }
-        
+
         elif method == "tools/call":
             """调用工具"""
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
-            
+
             if not tool_name:
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "error": {"code": -32602, "message": "缺少工具名称"}
                 }
-            
+
             result = await invoke_tool(tool_name, arguments)
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": result
             }
-        
+
         else:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32601, "message": f"未知方法: {method}"}
             }
-    
+
     except Exception as e:
         logger.error(f"处理请求失败: {e}", exc_info=True)
         return {
@@ -352,27 +352,27 @@ async def stdio_server():
     """启动 stdio 模式的 MCP Server"""
     logger.info("启动 DocReview MCP Server (stdio 模式)")
     logger.info("配置已从环境变量加载")
-    
+
     # 初始化运行时（异步）
     asyncio.create_task(_initialize_runtime())
-    
+
     # 读取输入并处理
     loop = asyncio.get_event_loop()
-    
+
     while True:
         try:
             # 异步读取一行输入
             line = await loop.run_in_executor(None, sys.stdin.readline)
-            
+
             if not line:
                 # 输入流结束
                 logger.info("输入流结束，退出服务器")
                 break
-            
+
             line = line.strip()
             if not line:
                 continue
-            
+
             try:
                 request = json.loads(line)
             except json.JSONDecodeError as e:
@@ -385,14 +385,14 @@ async def stdio_server():
                 print(json.dumps(response))
                 sys.stdout.flush()
                 continue
-            
+
             # 处理请求
             response = await process_request(request)
-            
+
             # 输出响应
             print(json.dumps(response))
             sys.stdout.flush()
-            
+
         except KeyboardInterrupt:
             logger.info("收到中断信号，退出服务器")
             break

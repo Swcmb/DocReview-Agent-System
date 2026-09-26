@@ -4,10 +4,8 @@
 """
 
 import logging
-import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 
 from rich.logging import RichHandler
 
@@ -29,7 +27,7 @@ class StructuredLogger:
             name: 日志记录器名称
         """
         self.name = name
-        self._logger: Optional[logging.Logger] = None
+        self._logger: logging.Logger | None = None
 
     @property
     def logger(self) -> logging.Logger:

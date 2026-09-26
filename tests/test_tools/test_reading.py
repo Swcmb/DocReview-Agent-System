@@ -1,10 +1,11 @@
 """文档读取工具测试模块 / Document Reading Tool Test Module"""
 
-import pytest
 from pathlib import Path
 
+import pytest
+
+from src.tools.base import ToolResult
 from src.tools.reading import ReadingTool
-from src.tools.base import ToolExecutionError, ToolResult
 
 
 @pytest.fixture

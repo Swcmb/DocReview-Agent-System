@@ -10,7 +10,6 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from src.tools.base import BaseTool, ToolResult
 
@@ -52,7 +51,7 @@ class TerminalTool(BaseTool):
         self,
         default_timeout: int = 300,
         enable_whitelist: bool = True,
-        cwd: Optional[str] = None
+        cwd: str | None = None
     ):
         """初始化终端工具 / Initialize Terminal Tool
 
@@ -74,8 +73,8 @@ class TerminalTool(BaseTool):
     def execute(
         self,
         command: str,
-        timeout: Optional[int] = None,
-        cwd: Optional[str] = None,
+        timeout: int | None = None,
+        cwd: str | None = None,
         retry: bool = True,
         **kwargs
     ) -> ToolResult:
@@ -143,7 +142,7 @@ class TerminalTool(BaseTool):
         self,
         command: str,
         timeout: int,
-        cwd: Optional[str]
+        cwd: str | None
     ) -> CommandResult:
         """实际执行命令 / Execute Command Internally
 
@@ -192,7 +191,7 @@ class TerminalTool(BaseTool):
             timed_out=timed_out
         )
 
-    def _check_command_safety(self, command: str) -> tuple[bool, Optional[str]]:
+    def _check_command_safety(self, command: str) -> tuple[bool, str | None]:
         """检查命令安全性 / Check Command Safety
 
         检查命令是否在黑名单或白名单中。

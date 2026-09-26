@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
-from typing import Any, Final
+from collections.abc import Iterable, Mapping
+from typing import Any, Final, cast
 
 __all__ = [
     "FROZEN_BUSINESS_QUESTIONS",
@@ -267,7 +267,7 @@ def schema_descriptor(ordered_questions: Mapping[str, Mapping[str, object]]) -> 
             assert isinstance(criteria, dict)
             item["criteria"] = [[key, criteria[key]] for key in criteria]
         elif question["type"] == "score":
-            item["criteria"] = list(question["criteria"])  # type: ignore[arg-type]
+            item["criteria"] = list(cast("Iterable[Any]", question["criteria"]))
         elif question["type"] == "noul" and "criteria" in question:
             # 键序按 true/false 固定；值参与哈希 —— 命题被改写或对调必改 hash
             criteria = question["criteria"]
@@ -280,7 +280,7 @@ def schema_descriptor(ordered_questions: Mapping[str, Mapping[str, object]]) -> 
             if isinstance(raw_labels, dict):
                 item["labels"] = [[key, raw_labels[key]] for key in sorted(raw_labels)]
             else:
-                item["labels"] = list(raw_labels)  # type: ignore[arg-type]
+                item["labels"] = list(cast("Iterable[Any]", raw_labels))
         descriptor.append(item)
     return descriptor
 

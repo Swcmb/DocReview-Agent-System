@@ -169,9 +169,13 @@ def create_router(config: Any, router_cls: type | None = None) -> Any:
             max_loaded=2,
         )
 
-    local_models: dict[str, Any] = build_local_model_mapping(Path(model_dir))
+    # 刻意标注为精确的 tuple mapping 类型（而非函数签名的 dict[str, Any]）：
+    # 下面的 cast 才是真实的一次「收紧类型 → 放宽给第三方 Router」的边界转换。
+    local_models: dict[str, tuple[str, str | None]] = build_local_model_mapping(Path(model_dir))
     return router_cls(
         # ↓↓↓ 全项目唯一的 typing.cast（Medium-04）。理由见模块 docstring。
+        # 上面的 local_models 已标注为精确 tuple mapping，故此处 cast 是真实的
+        # 「收紧类型 → 放宽给第三方 Router」边界转换，而非空操作。
         models=cast(dict[str, Any], local_models),
         device=None if config.device == AUTO else config.device,
         auto_task_detection=False,

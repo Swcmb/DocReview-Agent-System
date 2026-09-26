@@ -4,10 +4,8 @@
 """
 
 import difflib
-import os
 import re
 from pathlib import Path
-from typing import List, Optional
 
 from src.tools.base import BaseTool, ToolResult
 
@@ -98,7 +96,7 @@ class ReadingTool(BaseTool):
         # 尝试读取文件
         for enc in [encoding] + [e for e in self.allowed_encodings if e != encoding]:
             try:
-                with open(full_path, "r", encoding=enc) as f:
+                with open(full_path, encoding=enc) as f:
                     content = f.read()
                 return self._create_success_result(
                     data={

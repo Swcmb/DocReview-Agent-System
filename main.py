@@ -12,7 +12,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -118,7 +117,7 @@ def _print_laya_summary(result: dict) -> None:
 @app.callback()
 def main_callback(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="启用详细日志"),
-    config_path: Optional[str] = typer.Option(None, "--config", help="配置文件路径")
+    config_path: str | None = typer.Option(None, "--config", help="配置文件路径")
 ):
     """全局回调 - 配置日志和加载配置"""
     _configure_logging(verbose)
@@ -129,13 +128,13 @@ def main_callback(
 
 @app.command()
 def review(
-    doc_path: Optional[str] = typer.Option(None, "--doc-path", help="待审查文档路径"),
-    task: Optional[str] = typer.Option(None, "--task", help="任务描述"),
+    doc_path: str | None = typer.Option(None, "--doc-path", help="待审查文档路径"),
+    task: str | None = typer.Option(None, "--task", help="任务描述"),
     max_iterations: int = typer.Option(10, "--max-iterations", help="最大审查迭代次数"),
     output_dir: str = typer.Option("./reviews/", "--output-dir", help="审查报告输出目录"),
-    spec_output: Optional[str] = typer.Option(None, "--spec-output", help="规格文档输出路径"),
+    spec_output: str | None = typer.Option(None, "--spec-output", help="规格文档输出路径"),
     no_mcp: bool = typer.Option(False, "--no-mcp", help="禁用 MCP 服务"),
-    model: Optional[str] = typer.Option(None, "--model", help="覆盖 LLM 模型"),
+    model: str | None = typer.Option(None, "--model", help="覆盖 LLM 模型"),
     laya: bool | None = typer.Option(
         None, "--laya/--no-laya", help="启用/禁用 Laya 决策层（覆盖 LAYA__ENABLED）"
     )
@@ -249,6 +248,7 @@ def generate_spec(
     async def run_generate():
         try:
             from langchain_openai import ChatOpenAI
+
             from src.agents.supervisor import SupervisorAgent
 
             config = AppConfig()
@@ -292,7 +292,7 @@ def generate_spec(
 
 @app.command()
 def status(
-    thread_id: Optional[str] = typer.Option(None, "--thread-id", help="审查线程 ID")
+    thread_id: str | None = typer.Option(None, "--thread-id", help="审查线程 ID")
 ):
     """查看审查历史与状态"""
 
@@ -316,7 +316,7 @@ def status(
         target_file = reviews_dir / f"history-{thread_id}.json"
         if target_file.exists():
             try:
-                with open(target_file, "r", encoding="utf-8") as f:
+                with open(target_file, encoding="utf-8") as f:
                     data = json.load(f)
                 console.print(f"\n[bold]审查详情:[/bold] {thread_id}")
                 console.print(f"[cyan]规格版本:[/cyan] {data.get('spec_version', '-')}")
@@ -337,7 +337,7 @@ def status(
 
     for file_path in history_files[:20]:
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 data = json.load(f)
                 tid = data.get("thread_id", file_path.stem.replace("history-", ""))
                 spec_version = data.get("spec_version", "-")
@@ -353,7 +353,7 @@ def status(
 @app.command()
 def resume(
     thread_id: str = typer.Option(..., "--thread-id", help="审查线程 ID"),
-    approve: Optional[bool] = typer.Option(None, "--approve/--reject", help="批准或拒绝执行")
+    approve: bool | None = typer.Option(None, "--approve/--reject", help="批准或拒绝执行")
 ):
     """恢复中断的审查工作流"""
 

@@ -6,7 +6,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from src.utils.logger import get_logger
 
@@ -45,7 +45,7 @@ class PromptLoader:
         "MCP_COMPLETION_SUMMARY.md": "reports/mcp-completion-summary.md",
     }
 
-    def __init__(self, prompts_dir: Optional[Path] = None) -> None:
+    def __init__(self, prompts_dir: Path | None = None) -> None:
         """初始化提示词加载器 / Initialize Prompt Loader
 
         Args:
@@ -176,7 +176,7 @@ class PromptLoader:
         return file_path.exists()
 
 
-_prompt_loader: Optional[PromptLoader] = None
+_prompt_loader: PromptLoader | None = None
 
 
 def get_prompt_loader() -> PromptLoader:

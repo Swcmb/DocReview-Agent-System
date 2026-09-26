@@ -3,10 +3,9 @@
 提供 LLM 调用封装，支持多种提供商和成本追踪。
 """
 
-import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Optional, Dict
+from typing import Any
 
 from src.config import get_config
 from src.utils.logger import get_logger
@@ -14,7 +13,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # LLM 定价表（$/1M tokens）- prompt_price, completion_price
-LLM_PRICING: Dict[str, tuple[float, float]] = {
+LLM_PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4-turbo": (10.00, 30.00),
@@ -26,7 +25,7 @@ LLM_PRICING: Dict[str, tuple[float, float]] = {
 @dataclass
 class CostTracker:
     """成本追踪器 / Cost Tracker
-    
+
     用于追踪 LLM 调用的 token 用量和累计成本。
     """
     total_cost: float = 0.0
@@ -57,25 +56,25 @@ class CostTracker:
 def track_llm_cost(
     model: str,
     response_metadata: dict,
-    cost_tracker: Optional[CostTracker] = None
+    cost_tracker: CostTracker | None = None
 ) -> float:
     """追踪 LLM 成本 / Track LLM Cost
-    
+
     从响应元数据中提取 token 用量并计算成本。
-    
+
     Args:
         model: 模型名称
         response_metadata: LLM 响应元数据（包含 token_usage 或 usage）
         cost_tracker: 成本追踪器（可选）
-        
+
     Returns:
         float: 本次调用的成本（美元）
     """
     pricing = LLM_PRICING.get(model, (2.50, 10.00))
     prompt_price, completion_price = pricing
-    
+
     tokens = _extract_tokens(response_metadata)
-    
+
     if tokens:
         prompt_tokens, completion_tokens = tokens
     else:
@@ -83,10 +82,10 @@ def track_llm_cost(
         estimated_tokens = len(content) / 4 * 1.3
         prompt_tokens = int(estimated_tokens * 0.3)
         completion_tokens = int(estimated_tokens * 0.7)
-    
+
     cost = (prompt_tokens / 1_000_000) * prompt_price + \
            (completion_tokens / 1_000_000) * completion_price
-    
+
     if cost_tracker:
         cost_tracker.total_cost += cost
         cost_tracker.prompt_tokens += prompt_tokens
@@ -98,23 +97,23 @@ def track_llm_cost(
             "completion_tokens": completion_tokens,
             "cost": cost,
         })
-    
+
     logger.debug(
         f"LLM 成本: ${cost:.6f} "
         f"(model={model}, prompt={prompt_tokens}, completion={completion_tokens})"
     )
-    
+
     return cost
 
 
-def _extract_tokens(response_metadata: dict) -> Optional[tuple[int, int]]:
+def _extract_tokens(response_metadata: dict) -> tuple[int, int] | None:
     """从响应元数据中提取 token 用量 / Extract Tokens from Response Metadata
-    
+
     支持 OpenAI 和 Anthropic 格式。
-    
+
     Args:
         response_metadata: LLM 响应元数据
-        
+
     Returns:
         Optional[tuple[int, int]]: (prompt_tokens, completion_tokens) 或 None
     """
@@ -124,14 +123,14 @@ def _extract_tokens(response_metadata: dict) -> Optional[tuple[int, int]]:
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0)
         )
-    
+
     if "usage" in response_metadata:
         usage = response_metadata["usage"]
         return (
             usage.get("input_tokens", 0),
             usage.get("output_tokens", 0)
         )
-    
+
     return None
 
 
@@ -140,20 +139,20 @@ def check_budget(
     max_budget: float
 ) -> tuple[bool, str]:
     """检查是否超出预算 / Check Budget
-    
+
     Args:
         cost_tracker: 成本追踪器
         max_budget: 最大预算（美元），<=0 表示不限制
-        
+
     Returns:
         tuple[bool, str]: (是否超预算, 状态消息)
     """
     if max_budget <= 0:
         return False, ""
-    
+
     if cost_tracker.total_cost > max_budget:
         return True, f"超出预算: ${cost_tracker.total_cost:.4f} > ${max_budget:.2f}"
-    
+
     return False, ""
 
 
@@ -287,8 +286,9 @@ class LLMClient:
                 base_url=self.config.llm.base_url,
                 timeout=self.config.llm.request_timeout
             )
-        except ImportError:
-            raise LLMError("请安装 openai 包: pip install openai")
+        except ImportError as e:
+            # 缺包是配置问题而非调用链问题，链上 ImportError 只会让人误以为是下游出错
+            raise LLMError("请安装 openai 包: pip install openai") from e
 
     async def _init_anthropic(self) -> None:
         """初始化 Anthropic 客户端 / Initialize Anthropic Client"""
@@ -298,15 +298,16 @@ class LLMClient:
                 api_key=self.config.llm.api_key,
                 timeout=self.config.llm.request_timeout
             )
-        except ImportError:
-            raise LLMError("请安装 anthropic 包: pip install anthropic")
+        except ImportError as e:
+            # 缺包是配置问题而非调用链问题，链上 ImportError 只会让人误以为是下游出错
+            raise LLMError("请安装 anthropic 包: pip install anthropic") from e
 
     async def generate(
         self,
         prompt: str,
-        system: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        system: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None
     ) -> str:
         """生成文本 / Generate Text
 
@@ -342,9 +343,9 @@ class LLMClient:
     async def _generate_openai(
         self,
         prompt: str,
-        system: Optional[str],
+        system: str | None,
         temperature: float,
-        max_tokens: Optional[int]
+        max_tokens: int | None
     ) -> str:
         """使用 OpenAI 生成 / Generate with OpenAI
 
@@ -374,9 +375,9 @@ class LLMClient:
     async def _generate_anthropic(
         self,
         prompt: str,
-        system: Optional[str],
+        system: str | None,
         temperature: float,
-        max_tokens: Optional[int]
+        max_tokens: int | None
     ) -> str:
         """使用 Anthropic 生成 / Generate with Anthropic
 
@@ -400,7 +401,7 @@ class LLMClient:
         return response.content[0].text
 
 
-_llm_client: Optional[LLMClient] = None
+_llm_client: LLMClient | None = None
 
 
 def get_llm_client() -> LLMClient:
@@ -417,7 +418,7 @@ def get_llm_client() -> LLMClient:
 
 async def generate_response(
     prompt: str,
-    system: Optional[str] = None
+    system: str | None = None
 ) -> str:
     """快捷函数：生成 LLM 响应 / Convenience Function: Generate LLM Response
 

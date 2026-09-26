@@ -6,10 +6,8 @@ MCP (Model Context Protocol) 是一种标准协议，允许 LLM 与外部工具�
 """
 
 import asyncio
-import json
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -21,13 +19,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="DocReview MCP Server", version="1.0.0")
 
 # 存储运行时上下文
-_runtime_cache: Optional[Dict[str, Any]] = None
+_runtime_cache: dict[str, Any] | None = None
 
 
 class ReviewRequest(BaseModel):
     """文档审查请求"""
-    doc_path: Optional[str] = Field(default=None, description="待审查文档路径")
-    task: Optional[str] = Field(default=None, description="任务描述")
+    doc_path: str | None = Field(default=None, description="待审查文档路径")
+    task: str | None = Field(default=None, description="任务描述")
     max_iterations: int = Field(default=10, description="最大审查迭代次数")
 
 
@@ -37,14 +35,14 @@ class ReviewResponse(BaseModel):
     review_conclusion: str = Field(description="审查结论")
     iteration_count: int = Field(description="迭代轮次")
     total_llm_cost: float = Field(description="LLM 成本")
-    issues: List[Dict[str, Any]] = Field(default_factory=list, description="发现的问题列表")
-    reports: List[Dict[str, Any]] = Field(default_factory=list, description="审查报告列表")
+    issues: list[dict[str, Any]] = Field(default_factory=list, description="发现的问题列表")
+    reports: list[dict[str, Any]] = Field(default_factory=list, description="审查报告列表")
 
 
 class SpecGenerateRequest(BaseModel):
     """规格生成请求"""
     task: str = Field(description="任务描述")
-    document_content: Optional[str] = Field(default=None, description="参考文档内容")
+    document_content: str | None = Field(default=None, description="参考文档内容")
 
 
 class SpecGenerateResponse(BaseModel):
@@ -58,10 +56,10 @@ class HealthResponse(BaseModel):
     """健康检查响应"""
     status: str = Field(description="服务状态")
     llm_available: bool = Field(description="LLM 是否可用")
-    mcp_services: Dict[str, bool] = Field(description="MCP 服务状态")
+    mcp_services: dict[str, bool] = Field(description="MCP 服务状态")
 
 
-async def _get_runtime() -> Dict[str, Any]:
+async def _get_runtime() -> dict[str, Any]:
     """获取或初始化工作流运行时"""
     global _runtime_cache
     if _runtime_cache is None:
@@ -99,27 +97,27 @@ async def review_document(request: ReviewRequest):
 
     Args:
         request: 审查请求参数
-    
+
     Returns:
         ReviewResponse: 审查结果
     """
     try:
         logger.info(f"收到审查请求: doc_path={request.doc_path}, task={request.task}")
-        
+
         initial_state = {
             "user_task": request.task or "",
             "document_path": request.doc_path,
             "max_iterations": request.max_iterations
         }
-        
+
         result = await run_review_workflow(initial_state)
-        
+
         issues = []
         reports = []
         for report in result.get("review_reports", []):
             reports.append(report)
             issues.extend(report.get("issues", []))
-        
+
         return ReviewResponse(
             success=True,
             review_conclusion=result.get("review_conclusion", "unknown"),
@@ -128,10 +126,10 @@ async def review_document(request: ReviewRequest):
             issues=issues,
             reports=reports
         )
-    
+
     except Exception as e:
         logger.error(f"审查失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/generate-spec", response_model=SpecGenerateResponse)
@@ -140,33 +138,33 @@ async def generate_spec(request: SpecGenerateRequest):
 
     Args:
         request: 规格生成请求参数
-    
+
     Returns:
         SpecGenerateResponse: 规格文档
     """
     try:
         logger.info(f"收到规格生成请求: task={request.task[:50]}...")
-        
+
         initial_state = {
             "user_task": request.task,
             "document_content": request.document_content or "",
             "max_iterations": 1
         }
-        
+
         runtime = await _get_runtime()
         supervisor = runtime["supervisor"]
-        
+
         state = await supervisor.generate_spec(initial_state)
-        
+
         return SpecGenerateResponse(
             success=True,
             specification=state.get("specification", ""),
             spec_version=state.get("spec_version", 1)
         )
-    
+
     except Exception as e:
         logger.error(f"规格生成失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/tools")
@@ -200,51 +198,51 @@ async def list_tools():
 
 
 @app.post("/invoke")
-async def invoke_tool(request: Dict[str, Any]):
+async def invoke_tool(request: dict[str, Any]):
     """通用工具调用接口（MCP JSON-RPC 兼容）"""
     try:
         tool_name = request.get("name")
         arguments = request.get("arguments", {})
-        
+
         if tool_name == "review_document":
             result = await review_document(ReviewRequest(**arguments))
             return {"result": result.dict()}
-        
+
         elif tool_name == "generate_spec":
             result = await generate_spec(SpecGenerateRequest(**arguments))
             return {"result": result.dict()}
-        
+
         elif tool_name == "health_check":
             result = await health_check()
             return {"result": result.dict()}
-        
+
         else:
             raise HTTPException(status_code=404, detail=f"未知工具: {tool_name}")
-    
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"工具调用失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 # MCP 协议兼容的 JSON-RPC 端点
 @app.post("/")
-async def mcp_json_rpc(request: Dict[str, Any]):
+async def mcp_json_rpc(request: dict[str, Any]):
     """MCP JSON-RPC 端点"""
     try:
         jsonrpc_version = request.get("jsonrpc")
         request_id = request.get("id")
         method = request.get("method")
         params = request.get("params", {})
-        
+
         if jsonrpc_version != "2.0":
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32600, "message": "无效的 JSON-RPC 版本"}
             }
-        
+
         if method == "list_tools":
             tools = await list_tools()
             return {
@@ -252,17 +250,17 @@ async def mcp_json_rpc(request: Dict[str, Any]):
                 "id": request_id,
                 "result": tools
             }
-        
+
         elif method == "invoke":
             # params 可能是列表或对象
             if isinstance(params, list) and len(params) > 0:
                 tool_call = params[0] if params else {}
             else:
                 tool_call = params.get("tool", params)
-            
+
             tool_name = tool_call.get("name")
             arguments = tool_call.get("arguments", {})
-            
+
             if tool_name == "review_document":
                 result = await review_document(ReviewRequest(**arguments))
             elif tool_name == "generate_spec":
@@ -275,20 +273,20 @@ async def mcp_json_rpc(request: Dict[str, Any]):
                     "id": request_id,
                     "error": {"code": -32601, "message": f"未知方法: {method}"}
                 }
-            
+
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": result.dict() if hasattr(result, "dict") else result
             }
-        
+
         else:
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32601, "message": f"未知方法: {method}"}
             }
-    
+
     except Exception as e:
         logger.error(f"MCP JSON-RPC 错误: {e}")
         return {

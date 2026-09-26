@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
@@ -39,23 +39,37 @@ from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import AgentState
 from ..state.history_store import new_thread_id, save_review_history
 from ..state.issue_fingerprint import fingerprint_set
-from .review_routing import (
-    has_unresolved_blocking as has_unresolved_blocking,
-)
-from .review_routing import (
-    BUDGET_ERROR_CODE,
-    route_after_approval,
-    route_after_evaluate,
-    route_after_initialize,
-)
-from .review_routing import (
-    route_after_generate_spec as route_after_generate_spec,
-    route_after_load_document as route_after_load_document,
-    route_after_revise_spec as route_after_revise_spec,
-)
 from ..tools.reading import ReadingTool
 from ..tools.terminal import TerminalTool
 from ..tools.web_search import WebSearchTool
+from .review_routing import (
+    BUDGET_ERROR_CODE,
+)
+from .review_routing import (
+    has_unresolved_blocking as has_unresolved_blocking,
+)
+
+# 这三个路由函数定义在 review_routing，由本模块转出给图构建与测试。
+# mypy strict 隐含 --no-implicit-reexport：单纯 import 进来不算「显式导出」，
+# 故沿用本文件 has_unresolved_blocking 的同款 `X as X` 写法。
+from .review_routing import (
+    route_after_approval as route_after_approval,
+)
+from .review_routing import (
+    route_after_evaluate as route_after_evaluate,
+)
+from .review_routing import (
+    route_after_generate_spec as route_after_generate_spec,
+)
+from .review_routing import (
+    route_after_initialize as route_after_initialize,
+)
+from .review_routing import (
+    route_after_load_document as route_after_load_document,
+)
+from .review_routing import (
+    route_after_revise_spec as route_after_revise_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +188,7 @@ async def initialize(state: AgentState) -> AgentState:
         )
         await asyncio.wait_for(proc.communicate(), timeout=10)
         logger.info("Node.js 可用，MCP 服务可用")
-    except (FileNotFoundError, asyncio.TimeoutError):
+    except (TimeoutError, FileNotFoundError):
         logger.warning("Node.js 未安装或不可用，MCP 服务将被禁用")
         state["mcp_degraded"] = True
 
@@ -211,21 +225,6 @@ async def load_document(state: AgentState) -> AgentState:
         state["error_message"] = f"文档加载失败: {result.error}"
         logger.error(f"文档加载失败: {result.error}")
 
-    return state
-
-
-def user_approval(state: AgentState) -> AgentState:
-    """用户确认节点（中断点）
-
-    LangGraph 将在此节点中断，等待用户输入
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        当前状态
-    """
-    logger.info("等待用户确认")
     return state
 
 
@@ -618,7 +617,7 @@ def resolve_runtime_config(config: Any = None) -> AppConfig:
 
 async def create_workflow_runtime(
     config: Any | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """创建工作流运行时环境
 
     初始化所有必要的组件并返回工作流实例
@@ -700,8 +699,8 @@ async def create_workflow_runtime(
 
 
 async def run_review_workflow(
-    initial_state: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None
+    initial_state: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None
 ) -> AgentState:
     """运行审查工作流的便捷函数
 
@@ -724,9 +723,9 @@ async def run_review_workflow(
 
 
 async def run_review_workflow_with_interrupts(
-    initial_state: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    initial_state: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """运行审查工作流，支持用户中断点
 
     在 user_approval 节点会暂停，等待用户确认后继续。

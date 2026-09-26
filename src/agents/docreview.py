@@ -248,6 +248,9 @@ class DocReviewAgent:
             self.logger.error(f"审查过程出错: {e}")
             state["error_code"] = "DOCREVIEW_ERR_SYS_001"
             state["error_message"] = f"审查失败: {str(e)}"
+            # 失败轮次同样计入迭代：保证 iteration_count 每轮都前进，
+            # 否则 route_after_evaluate 的轮次上限分支永不成立，循环无法终止。
+            state["iteration_count"] = iteration
             return state
     
     async def _think_step(

@@ -86,6 +86,49 @@ def test_is_stagnant_partial_overlap():
     assert _is_stagnant(state) is False
 
 
+def test_is_stagnant_same_content_different_round_ids():
+    """Step 0 验收：两轮问题集合内容相同但 issue_id 轮次不同 → 判为停滞
+
+    issue_id 内嵌轮次号（如 BK-1-1 与 BK-2-1），按 id 比较恒不成立；
+    修复后按内容身份（severity + issue_type + 规范化 description 哈希）比较。
+    """
+    state = {
+        "review_reports": [
+            {"issues": [{
+                "issue_id": "BK-1-1", "severity": "Blocking",
+                "issue_type": "consistency",
+                "description": "需求 FR-001 与验收标准冲突！",
+            }]},
+            {"issues": [{
+                "issue_id": "BK-2-1", "severity": "Blocking",
+                "issue_type": "consistency",
+                "description": "需求 FR-001 与验收标准冲突",
+            }]},
+        ]
+    }
+    # 轮次号不同 + description 仅标点差异 → 归一化后应判为停滞
+    assert _is_stagnant(state) is True
+
+
+def test_is_stagnant_content_change_not_stagnant():
+    """Step 0 验收：问题描述实质变化 → 不判停滞"""
+    state = {
+        "review_reports": [
+            {"issues": [{
+                "issue_id": "BK-1-1", "severity": "Blocking",
+                "issue_type": "consistency",
+                "description": "需求 A 与验收标准冲突",
+            }]},
+            {"issues": [{
+                "issue_id": "BK-2-1", "severity": "Blocking",
+                "issue_type": "consistency",
+                "description": "完全不同的新问题",
+            }]},
+        ]
+    }
+    assert _is_stagnant(state) is False
+
+
 def test_prune_review_history():
     """测试审查历史压缩"""
     state = {

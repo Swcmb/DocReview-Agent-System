@@ -373,10 +373,33 @@ async def finalize(state: AgentState) -> AgentState:
     return state
 
 
+def _issue_fingerprint(issue: dict) -> tuple:
+    """问题的内容身份：severity + issue_type + 规范化 description 哈希
+
+    issue_id 内嵌轮次号，跨轮必然不同，不能用作停滞比较的身份。
+    description 规范化（去空白、去标点、转小写）后哈希，
+    使同义改写仍被视为同一问题。
+
+    Args:
+        issue: 单条审查问题
+
+    Returns:
+        可比较的元组身份
+    """
+    import hashlib
+    import re
+
+    raw = issue.get("description", "")
+    normalized = re.sub(r"[\s\W_]+", "", raw, flags=re.UNICODE).lower()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return (issue.get("severity", ""), issue.get("issue_type", ""), digest)
+
+
 def _is_stagnant(state: AgentState) -> bool:
     """检测审查问题列表是否停滞（连续两轮无变化）
 
-    通过比较最近两轮的问题 ID 集合来判断是否停滞。
+    通过比较最近两轮问题的内容身份集合来判断是否停滞
+    （severity + issue_type + 规范化 description 哈希）。
 
     Args:
         state: 当前工作流状态
@@ -388,8 +411,8 @@ def _is_stagnant(state: AgentState) -> bool:
     if len(reports) < 2:
         return False
 
-    this_issues = {i["issue_id"] for i in reports[-1].get("issues", [])}
-    prev_issues = {i["issue_id"] for i in reports[-2].get("issues", [])}
+    this_issues = {_issue_fingerprint(i) for i in reports[-1].get("issues", [])}
+    prev_issues = {_issue_fingerprint(i) for i in reports[-2].get("issues", [])}
 
     return this_issues == prev_issues
 
@@ -432,6 +455,7 @@ def _save_review_history(state: AgentState) -> None:
         output = {
             "thread_id": thread_id,
             "spec_version": state.get("spec_version", 1),
+            "specification": state.get("specification", ""),
             "review_conclusion": state.get("review_conclusion", "unknown"),
             "total_llm_cost": state.get("total_llm_cost", 0),
             "reports": state.get("review_reports", [])

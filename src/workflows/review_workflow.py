@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,11 @@ from langgraph.graph import END, StateGraph
 from ..agents.docreview import DocReviewAgent
 from ..agents.supervisor import SupervisorAgent
 from ..config import AppConfig
+from ..decisions.factory import (
+    await_thread,
+    configure_provider,
+    get_decision_engine,
+)
 from ..mcp.context7 import Context7Client
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import AgentState
@@ -439,6 +445,10 @@ def build_workflow(
     workflow.add_node("initialize", initialize)
     workflow.add_node("load_document", load_document)
     workflow.add_node("generate_spec", supervisor.generate_spec)
+    # 决策层文档级原语（§13.1）。两者都在审查开始前对 spec 施加标注，故串在
+    # generate_spec 与 docreview 之间；engine 为 None 时各自首行返回、零差异。
+    workflow.add_node("screen", docreview_agent.screen_spec)
+    workflow.add_node("assess", docreview_agent.assess_spec)
     workflow.add_node("docreview", docreview_agent.review)
     workflow.add_node("evaluate_result", evaluate_result)
     workflow.add_node("revise_spec", supervisor.revise_spec)
@@ -458,7 +468,9 @@ def build_workflow(
     )
 
     workflow.add_edge("load_document", "generate_spec")
-    workflow.add_edge("generate_spec", "docreview")
+    workflow.add_edge("generate_spec", "screen")
+    workflow.add_edge("screen", "assess")
+    workflow.add_edge("assess", "docreview")
     workflow.add_edge("docreview", "evaluate_result")
     workflow.add_edge("revise_spec", "docreview")
     workflow.add_edge("execute", "finalize")
@@ -493,6 +505,97 @@ def build_workflow(
     )
 
 
+#: Laya 源 checkout 路径（规格 §20 固定的探测目标）。权重不入库，editable 安装的源
+#: 才是运行时身份的依据。
+LAYA_SOURCE_ROOT = r"D:\DocReviewer\laya-github"
+
+
+def _probe_laya_source() -> tuple[str, bool, str]:
+    """探测 Laya 源身份，返回 ``(runtime_commit, source_tree_clean, runtime_source_digest)``。
+
+    §8.3：三者任一不可信，engine 只能 audit/degraded，**不得 act**。故本函数
+    fail-closed——git 不可用、路径不存在、HEAD 非 40 位 SHA、tracked ``laya/``
+    有未提交改动，一律返回 ``("", False, "")``，绝不猜测或放宽阈值。
+
+    只探测 tracked 的包路径 ``laya``：untracked 的 ``.claude`` 等与运行时无关，
+    把它们计入会让一个干净的 checkout 永久显示为 dirty。
+    """
+    try:
+        commit = subprocess.run(
+            ["git", "-C", LAYA_SOURCE_ROOT, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        if len(commit) != 40:
+            return "", False, ""
+        dirty = subprocess.run(
+            ["git", "-C", LAYA_SOURCE_ROOT, "status", "--porcelain", "--", "laya"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", False, ""
+    # digest 直接取 HEAD：§8.3 的 runtime_source_digest 标识「跑的是哪份源码」，
+    # 而 commit 已是该内容的唯一标识，另算一份 hash 只会引入第二处真相。
+    return commit, (not dirty), commit
+
+
+def _load_guard_questions() -> dict[str, Any]:
+    """惰性取 laya preset 的 guard questions；取不到返回空表（fail-closed）。
+
+    guard 原语的 question **不在** §5.2 的冻结契约内（其 noul 无 ``criteria`` 键），
+    只能来自 laya 自己的 preset。取不到时退化为空表 → screen 只产 uncertain。
+    """
+    try:
+        presets = __import__("laya.presets", fromlist=["guard_questions"])
+        return dict(presets.guard_questions())
+    except Exception:  # noqa: BLE001 - 取不到就退化为空表，不冒泡
+        return {}
+
+
+def _build_decision_provider(app_config: AppConfig) -> Any:
+    """构造决策层 provider 工厂；**未启用时返回 None**（§15 F5）。
+
+    返回 None 而非一个 ``NullDecisionEngine`` 是刻意的：未启用时决策层根本不该
+    存在，工厂据此给出 degraded handle（``engine=None``），
+    ``DocReviewAgent._run_decision_layer`` 首行即返回，业务快照与禁用态零差异。
+    若注入 Null 实例，「决策层没跑」与「决策层跑了但恒 uncertain」就变得不可区分。
+    """
+    laya_config = getattr(app_config, "laya", None)
+    if laya_config is None or not getattr(laya_config, "enabled", False):
+        return None
+
+    def _factory(*, timeout_seconds: int = 60) -> Any:
+        # 重量级模块放工厂内导入：未启用时它们根本不被加载（T-03 导入边界）。
+        from ..decisions.laya_adapter import create_router, predict_batch
+        from ..decisions.laya_decisions import LayaDecisionEngine, RuntimeProvenance
+
+        commit, clean, digest = _probe_laya_source()
+        router = create_router(laya_config)
+
+        def _predict(batch: Any) -> Any:
+            return predict_batch(router, batch, laya_config.batch_size)
+
+        return LayaDecisionEngine(
+            laya_config,
+            provenance=RuntimeProvenance(
+                laya_runtime_commit=commit,
+                source_tree_clean=clean,
+                runtime_source_digest=digest,
+                requested_device=str(getattr(laya_config, "device", "cpu")),
+                actual_device=str(getattr(laya_config, "device", "cpu")),
+            ),
+            predict=_predict,
+            guard_questions=_load_guard_questions(),
+            # §0.2：本轮无人工校准语料 → 空阈值表 → 五原语恒 uncertain。
+            # 这是刻意的：宁可不产出业务效果，也不产出未校准的结论。
+            thresholds={},
+            # §8.3：spec 内容哈希缺失即禁止 act。engine 构造期无从得知被评审的
+            # 规格内容，故留空；本轮接线只做 audit。
+            spec_content_sha256=None,
+        )
+
+    return _factory
+
+
 async def create_workflow_runtime(
     config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -507,6 +610,22 @@ async def create_workflow_runtime(
         包含 workflow、agents、tools 等的字典
     """
     app_config = AppConfig()
+
+    # ── 决策层接线（T-17b）────────────────────────────────────────────
+    # 未启用时 `_build_decision_provider` 返回 None，`configure_provider(None)`
+    # 显式清空 provider：factory 是进程级单例，不清会让上一次启用留下的 engine
+    # 泄漏到本次「禁用」的运行里，直接违反 F5 的零差异契约。
+    configure_provider(_build_decision_provider(app_config))
+    # engine 构造会加载权重，必须经 to_thread，否则阻塞事件循环。
+    decision_handle = await await_thread(
+        get_decision_engine,
+        timeout_seconds=getattr(app_config.laya, "timeout_seconds", 60),
+    )
+    decision_engine = decision_handle.engine
+    if decision_handle.is_degraded:
+        logger.info(
+            f"决策层不可用（{decision_handle.degraded_reason}）：审查按纯 LLM 路径进行"
+        )
 
     try:
         from langchain_openai import ChatOpenAI
@@ -542,7 +661,8 @@ async def create_workflow_runtime(
         llm=llm,
         sequential_thinking=seq_thinking,
         context7=context7,
-        tools=[reading_tool, web_search_tool]
+        tools=[reading_tool, web_search_tool],
+        decision_engine=decision_engine
     )
 
     workflow = build_workflow(supervisor, docreview_agent)
@@ -554,6 +674,7 @@ async def create_workflow_runtime(
         "llm": llm,
         "seq_thinking": seq_thinking,
         "context7": context7,
+        "decision_engine": decision_engine,
         "config": app_config
     }
 

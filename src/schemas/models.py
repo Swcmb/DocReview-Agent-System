@@ -107,6 +107,19 @@ class AgentState(TypedDict):
     # §12.2：thread_id 只生成一次并写回 state，后续 finalize 复用。
     # 入口为空串，由 history_store 在首次落盘时填充。
     thread_id: str
+    # §13.1／§12.2：决策层审计与标注字段。
+    #
+    # 刻意**不进** `create_initial_state()`：§15 F5 要求「禁用时业务快照与
+    # LAYA__ENABLED=false 完全相同」，预填空列表本身就是一处可观测差异。
+    # 缺键即代表「本轮没有决策层输出」，与「决策层输出了空结果」必须可区分。
+    #
+    # 刻意用普通注解而非 `NotRequired[...]`：LangGraph 建图时会把这个 TypedDict
+    # 交给 pydantic `create_model` 生成输入/输出 schema，而 pydantic 在该上下文
+    # 明确拒绝 `NotRequired` 限定符（PydanticForbiddenQualifier），会让
+    # `build_workflow()` 直接抛错。「字段不出现」由 TypedDict 键的缺失表达，
+    # 不需要该限定符——本文件其余字段一律用普通注解，保持一致。
+    laya_findings: list[dict[str, Any]]
+    laya_trace: list[dict[str, Any]]
 
 
 SEVERITY_BLOCKING = "Blocking"

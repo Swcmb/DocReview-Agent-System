@@ -28,6 +28,7 @@ from langchain.schema import HumanMessage
 
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..decisions.issue_id import assign_issue_ids
+from ..decisions.types import DecisionContext
 from ..utils.llm import CostTracker, invoke_with_cost, resolve_cost_model
 from ..schemas.models import (
     SEVERITY_BLOCKING,
@@ -160,6 +161,7 @@ class DocReviewAgent:
         sequential_thinking: Optional[SequentialThinkingClient] = None,
         context7: Any = None,
         tools: Optional[List[BaseTool]] = None,
+        decision_engine: Any = None,
     ) -> None:
         """初始化 DocReview Agent
 
@@ -168,10 +170,18 @@ class DocReviewAgent:
             sequential_thinking: Sequential Thinking MCP 客户端（可选）
             context7: 保留参数以兼容，实际不再使用
             tools: 可用工具列表
+            decision_engine: 决策层引擎（`LayaDecisionEngine` 或 `NullDecisionEngine`）。
+
+                **默认 `None` 即「决策层不存在」**，`review()` 会完全跳过五原语且不写
+                任何 `laya_*` 键——这是 §15 F5「禁用时业务快照与 LAYA__ENABLED=false
+                完全相同」的实现基础。刻意不默认注入 `NullDecisionEngine`：那会让
+                「禁用」与「启用但恒 uncertain」两种情形产生同样的空结果，
+                从而无法区分「决策层没跑」与「决策层跑了但没结论」。
         """
         self.llm = llm
         self.sequential_thinking = sequential_thinking
         self.tools = tools or []
+        self.decision_engine = decision_engine
         self.logger = logger
 
     async def review(self, state: AgentState) -> AgentState:
@@ -235,6 +245,11 @@ class DocReviewAgent:
             # 顺序很重要——verify_issues/verify_resolutions 只消费已分配 ID 的
             # 快照，Markdown 编译器也不再分配。
             assign_issue_ids(all_issues, iteration)
+
+            # 决策层五原语：只写 laya_findings / laya_trace，不改业务字段（§8.1）。
+            # 放在 ID 分配之后——verify_issues/verify_resolutions 按 issue_id 关联快照。
+            # 放在 Markdown 编译之前：审计链要能引用最终报告同一批 ID。
+            await self._run_decision_layer(state, spec, all_issues, iteration)
             
             markdown_report = self._compile_markdown_report(all_issues, iteration)
             
@@ -280,6 +295,173 @@ class DocReviewAgent:
                     state.get("total_llm_cost", 0.0) + local_tracker.total_cost
                 )
     
+    # ── 决策层节点与原语分流（T-17b / §13.1）─────────────────────────
+    # screen/assess 作用于**文档**本身，不依赖任何一轮的 issue 快照，故各占一个
+    # 图节点；verify_issues/verify_resolutions/judge_convergence 要读上一轮与本轮
+    # 的 issue 快照，只能在 review() 拿到 all_issues 之后调用，故留在 review() 内。
+    # 这样每个原语只在**唯一**一处被调用——否则同一 guard 会在 trace 里留下两条
+    # 记录，审计方无法区分「跑过一次」和「跑了两次」。
+
+    @staticmethod
+    def _decision_context(state: AgentState, iteration: int) -> DecisionContext:
+        """构造决策层上下文。
+
+        iteration 语义随调用点而变：文档级原语发生在审查轮次之前，恒为 0；
+        issue 级原语传本轮轮次。
+        """
+        return DecisionContext(
+            thread_id=state.get("thread_id", "") or "",
+            iteration=iteration,
+            spec_version=state.get("spec_version", 0),
+        )
+
+    @staticmethod
+    def _append_decision_output(
+        state: AgentState,
+        findings: list[dict[str, Any]],
+        trace: list[dict[str, Any]],
+    ) -> None:
+        """跨轮累积 findings / trace。finalize 把这两个键整体写进 history 顶层。"""
+        if findings:
+            state["laya_findings"] = list(state.get("laya_findings", [])) + findings
+        if trace:
+            state["laya_trace"] = list(state.get("laya_trace", [])) + trace
+
+    async def screen_spec(self, state: AgentState) -> AgentState:
+        """screen 节点：文档级 guard。**只产 warning finding，不拒绝、不改文**（§8.1）。
+
+        F5 契约：`decision_engine is None`（未启用 / 已降级）时**首行即返回**，
+        不写任何 `laya_*` 键——「决策层没跑」与「决策层跑了但恒 uncertain」必须可区分，
+        前者的业务快照要与 `LAYA__ENABLED=false` 逐字段相同。
+        """
+        engine = self.decision_engine
+        if engine is None:
+            return state
+
+        try:
+            spec = state.get("specification", "") or ""
+            # 文档级原语发生在审查轮次之前，iteration 恒为 0。
+            result = await engine.screen_document(
+                spec, context=self._decision_context(state, 0)
+            )
+            self._append_decision_output(
+                state,
+                list(result.get("findings", [])),
+                list(result.get("trace", [])),
+            )
+        except Exception as e:  # noqa: BLE001 - 增强层不得拖垮业务审查
+            self.logger.warning(f"screen 原语失败（不影响审查结果）: {e}")
+        return state
+
+    async def assess_spec(self, state: AgentState) -> AgentState:
+        """assess 节点：文档级完备度标注。`route_action` 恒 `no_action`（§8.1）。"""
+        engine = self.decision_engine
+        if engine is None:
+            return state
+
+        try:
+            spec = state.get("specification", "") or ""
+            # section_index 传 None：决策层允许无索引运行（§5 投影纪律），
+            # 而让 agent 层依赖 SectionIndex 会把两套分块语义耦合在一起。
+            result = await engine.assess_document(
+                spec, None, context=self._decision_context(state, 0)
+            )
+            self._append_decision_output(
+                state,
+                [dict(w) for w in (result.get("warnings") or [])],
+                list(result.get("trace", [])),
+            )
+        except Exception as e:  # noqa: BLE001 - 增强层不得拖垮业务审查
+            self.logger.warning(f"assess 原语失败（不影响审查结果）: {e}")
+        return state
+
+    async def _run_decision_layer(
+        self,
+        state: AgentState,
+        spec: str,
+        current_issues: list[IssueStatus],
+        iteration: int,
+    ) -> None:
+        """调用 issue 级三原语，把 findings / trace 写入 state。**不改任何业务字段**。
+
+        §8.1 把这三个原语全部限定为标注或 audit-only：`verify_issues` 不删 issue、
+        不改 severity；`verify_resolutions` 的 `audit_only` 恒为 True；
+        `judge_convergence` 的 `suggested_loop_cap` 恒为 None。故本方法只往
+        `laya_findings` / `laya_trace` 写，**绝不**回写 `all_issues` /
+        `review_conclusion` / `issue_tracker`。
+
+        F5 契约与 `screen_spec` / `assess_spec` 同源：`decision_engine is None`
+        时首行即返回。决策层的任何异常都在此吞掉：它是增强层，挂了不能拖垮业务审查。
+        """
+        engine = self.decision_engine
+        if engine is None:
+            return
+
+        try:
+            context = self._decision_context(state, iteration)
+            section_index = None
+
+            reports = state.get("review_reports", [])
+            previous_issues: list[IssueStatus] = (
+                list(reports[-1].get("issues", [])) if reports else []
+            )
+            tracker = state.get("issue_tracker", {})
+
+            counts = {
+                "iteration": iteration,
+                "previous_issues": len(previous_issues),
+                "current_issues": len(current_issues),
+            }
+
+            findings: list[dict[str, Any]] = []
+            trace: list[dict[str, Any]] = []
+
+            # 1) verify_issues：只加标注，转成 LayaFinding 形状供摘要统一消费。
+            verified = await engine.verify_issues(
+                current_issues, spec, section_index, context=context
+            )
+            for item in verified:
+                trace.extend(item.get("trace", []))
+                findings.append(self._verified_to_finding(item))
+
+            # 2) verify_resolutions：只审计 observed_status，audit_only 恒 True。
+            resolutions = await engine.verify_resolutions(
+                previous_issues, spec, section_index, context=context
+            )
+            for item in resolutions:
+                trace.extend(item.get("trace", []))
+
+            # 3) judge_convergence：仅两个 noul 可建议 cap。
+            convergence = await engine.judge_convergence(
+                previous_issues, current_issues, counts, tracker, context=context
+            )
+            trace.extend(convergence.get("trace", []))
+
+            self._append_decision_output(state, findings, trace)
+
+        except Exception as e:  # noqa: BLE001 - 增强层不得拖垮业务审查
+            self.logger.warning(f"决策层调用失败（不影响审查结果）: {e}")
+
+    @staticmethod
+    def _verified_to_finding(item: dict[str, Any]) -> dict[str, Any]:
+        """把 `VerifiedIssue` 收敛成 `LayaFinding` 形状。
+
+        severity_review 是自由字符串，落到 `FindingSeverity`（info/warning/high）
+        之外的值一律降为 `info`——决策层是标注层，不允许它抬高告警等级。
+        """
+        severity = item.get("severity_review")
+        if severity not in ("info", "warning", "high"):
+            severity = "info"
+        note = item.get("laya_note") or f"grounded={item.get('grounded')}"
+        return {
+            "finding_id": f"verify-{item.get('issue_id', 'unknown')}",
+            "kind": "verify_issue",
+            "severity": severity,
+            "message": str(note),
+            "source": "laya",
+            "decision_ids": [str(item.get("issue_id", ""))],
+        }
+
     async def _think_step(
         self,
         step_name: str,

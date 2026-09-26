@@ -16,6 +16,7 @@ T-04 范围：SectionRecord / 行级状态机 / CRLF / fence / LocationResolutio
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import re
 from collections.abc import Iterator
@@ -24,9 +25,13 @@ from typing import Final, NamedTuple, TypedDict
 __all__ = [
     "SectionIndex",
     "SectionRecord",
+    "SectionChunk",
     "LocationResolution",
     "build_section_index",
     "normalize_location",
+    "chunk_sections",
+    "MAX_CHARS_PER_CHUNK",
+    "MAX_SELECTED_CHUNKS",
     "LOC_EMPTY",
     "LOC_INVALID_FORMAT",
     "LOC_UNKNOWN_SECTION",
@@ -57,6 +62,31 @@ class LocationResolution(TypedDict):
     normalized: str | None
     error_code: str | None
     error_message: str | None
+
+
+class SectionChunk(TypedDict):
+    """section 的一个分块（§6.2），由 `chunk_sections` 产出（§6.5）。"""
+
+    chunk_id: str
+    section_id: str
+    ordinal: int
+    start: int
+    end: int
+    start_line: int
+    end_line: int
+    text_sha256: str
+    text: str
+    selected: bool
+    total_chunks: int
+    selected_chunks: int
+    omitted_chunks: int
+    omitted_indices: list[int]
+
+
+#: §6.5 固定值。1024 按 Unicode code point 计数（不是字节）。
+MAX_CHARS_PER_CHUNK: Final = 1024
+#: §6.5 单个 section 最多进入 inference 的 chunk 数：N<=8 全选，N>8 取前 4 后 4。
+MAX_SELECTED_CHUNKS: Final = 8
 
 
 # ---------------------------------------------------------------------------
@@ -518,3 +548,140 @@ def normalize_location(
     return LocationResolution(
         valid=True, normalized=hits[0]["section_id"], error_code=None, error_message=None
     )
+
+
+# ---------------------------------------------------------------------------
+# §6.5 分块算法
+# ---------------------------------------------------------------------------
+def _safe_cut(text: str, start: int, limit: int, section_end: int) -> int:
+    """在 ``[start, limit)`` 内找安全切点，返回相对 ``start`` 的长度。
+
+    优先切在**最后一个换行或空白之后**（§6.5），且绝不把 CRLF 切成两半。
+    返回 0 表示窗口内没有安全边界，调用方应走 1024 硬切。
+
+    切在空白**之后**而非之前，是为了让空白留在前一块的尾部——正文不会被
+    下一块以半个词开头的方式接续。
+    """
+    window = text[start:limit]
+    index = -1
+    for i in range(len(window) - 1, -1, -1):
+        if window[i].isspace():
+            index = i
+            break
+    if index < 0:
+        return 0
+    cut = index + 1
+    absolute = start + cut
+    # 切点若落在 \r 与 \n 之间，回退一格，CRLF 保持完整
+    if absolute < section_end and text[absolute - 1] == "\r" and text[absolute] == "\n":
+        cut -= 1
+    return cut if cut > 0 else 0
+
+
+def _hard_cut_length(text: str, start: int, limit: int, section_end: int) -> int:
+    """没有安全边界时的 1024 硬切长度，同样不得切断 CRLF。"""
+    length = limit - start
+    if length > 1 and limit < section_end and text[limit - 1] == "\r" and text[limit] == "\n":
+        length -= 1
+    return length
+
+
+def _split_bounds(text: str, record: SectionRecord) -> list[tuple[int, int]]:
+    """把单个 section 切成互不重叠、完整覆盖的 ``[start, end)`` 区间序列。
+
+    分块单位是 SectionRecord，**不跨 section 合并**（§6.5）——因此每个 section
+    独立切分，尾块可以短于 1024。
+    """
+    bounds: list[tuple[int, int]] = []
+    start = record["start"]
+    end = record["end"]
+    while start < end:
+        limit = min(start + MAX_CHARS_PER_CHUNK, end)
+        if limit >= end:
+            bounds.append((start, end))
+            break
+        cut = _safe_cut(text, start, limit, end)
+        if cut > 0:
+            bounds.append((start, start + cut))
+            start += cut
+        else:
+            length = _hard_cut_length(text, start, limit, end)
+            bounds.append((start, start + length))
+            start += length
+    return bounds
+
+
+def _select_ordinals(total: int) -> set[int]:
+    """返回被选中的 ordinal 集合（§6.5）。
+
+    ``N <= 8`` 全选；``N > 8`` 固定取前 4 与后 4。两者在 ``N > 8`` 时必然不重叠，
+    因为 ``2 * 4 = 8 < N``。N=9 时恰好省略中间那一个，``omitted_indices == [4]``。
+    """
+    if total <= MAX_SELECTED_CHUNKS:
+        return set(range(total))
+    head = MAX_SELECTED_CHUNKS // 2
+    tail = MAX_SELECTED_CHUNKS - head
+    return set(range(head)) | set(range(total - tail, total))
+
+
+def chunk_sections(index: SectionIndex, text: str) -> list[SectionChunk]:
+    """把 SectionIndex 展开为带选择标记的分块列表（§6.5）。
+
+    只有 ``selected=True`` 的 chunk 携带正文；omitted chunk 的 ``text`` 为空串，
+    仅保留 offset、行号与摘要等元数据（§6.5「omitted chunk 只保留元数据」）。
+    ``text_sha256`` 始终是**真实**正文的摘要——摘要不是正文，据此仍可校验被省略
+    内容的身份，而不必把它送进 inference。
+
+    Args:
+        index: `build_section_index` 的产物。
+        text: 生成该索引时的解码后原文（需与索引同源，否则 offset 会错位）。
+
+    Returns:
+        扁平的 SectionChunk 列表，按 section 顺序、section 内按 ordinal 升序。
+    """
+    chunks: list[SectionChunk] = []
+    # 精确的 offset -> 行号映射。不能用「数换行符」的算术：chunk 边界可能把
+    # CRLF 截成半个（text[start:end-1] 里只剩 \r），换行符正则会把截断的 CRLF
+    # 误判成一次换行，导致 end_line 偏大 1。直接复用行首 offset 表做二分。
+    line_starts = [line.start for line in _iter_lines(text)]
+
+    def line_of(offset: int) -> int:
+        """offset 所在行的 1-based 行号（`line_starts` 含 0，故 bisect 结果即行号）。"""
+        if not line_starts:
+            return 1
+        return bisect.bisect_right(line_starts, offset)
+
+    for record in index:
+        bounds = _split_bounds(text, record)
+        total = len(bounds)
+        if total == 0:
+            # 空 section（如空文档的 S1）不产出分块，避免出现空 selected chunk
+            continue
+        selected_ordinals = _select_ordinals(total)
+        omitted_indices = [i for i in range(total) if i not in selected_ordinals]
+        selected_chunks = len(selected_ordinals)
+
+        for ordinal, (start, end) in enumerate(bounds):
+            body = text[start:end]
+            selected = ordinal in selected_ordinals
+            chunks.append(
+                SectionChunk(
+                    chunk_id=f"{record['section_id']}#c{ordinal}",
+                    section_id=record["section_id"],
+                    ordinal=ordinal,
+                    start=start,
+                    end=end,
+                    # end_line 取最后一个内容字符所在行（end-1），闭区间
+                    start_line=line_of(start),
+                    end_line=line_of(end - 1),
+                    text_sha256=_sha256(body),
+                    # 只有 selected chunk 携带正文
+                    text=body if selected else "",
+                    selected=selected,
+                    total_chunks=total,
+                    selected_chunks=selected_chunks,
+                    omitted_chunks=total - selected_chunks,
+                    omitted_indices=omitted_indices,
+                )
+            )
+    return chunks

@@ -19,7 +19,10 @@ from src.state.section_index import (
     LOC_INVALID_FORMAT,
     LOC_LINE_OUT_OF_RANGE,
     LOC_UNKNOWN_SECTION,
+    MAX_CHARS_PER_CHUNK,
+    MAX_SELECTED_CHUNKS,
     build_section_index,
+    chunk_sections,
     normalize_location,
 )
 
@@ -520,3 +523,233 @@ def test_plain_list_index_is_accepted() -> None:
     """普通 list[SectionRecord] 也应可用（SectionIndex 只是加了标记的 list）。"""
     records = list(build_section_index(_INDEX_DOC))
     assert normalize_location("S1", records)["valid"] is True
+
+
+# ---------------------------------------------------------------------------
+# §6.5 分块算法（T-05）
+# ---------------------------------------------------------------------------
+def _exact_chunks(n: int) -> list:
+    """构造恰好 n 块的 section：无空白无换行 -> 全部硬切 -> N 可精确控制。"""
+    doc = "a" * (n * MAX_CHARS_PER_CHUNK)
+    return chunk_sections(build_section_index(doc), doc)
+
+
+def test_n9_golden_omitted_indices_is_exactly_4() -> None:
+    """§6.5 点名 golden：N=9 的 omitted_indices 必须精确为 [4]。"""
+    chunks = _exact_chunks(9)
+    assert chunks[0]["total_chunks"] == 9
+    assert chunks[0]["selected_chunks"] == 8
+    assert chunks[0]["omitted_chunks"] == 1
+    assert chunks[0]["omitted_indices"] == [4]
+    assert [c["ordinal"] for c in chunks if c["selected"]] == [0, 1, 2, 3, 5, 6, 7, 8]
+
+
+@pytest.mark.parametrize("n", [1, 2, 7, 8])
+def test_n_up_to_8_selects_everything(n: int) -> None:
+    """§6.5：N <= 8 全部选中。"""
+    chunks = _exact_chunks(n)
+    assert chunks[0]["total_chunks"] == n
+    assert chunks[0]["selected_chunks"] == n
+    assert chunks[0]["omitted_chunks"] == 0
+    assert chunks[0]["omitted_indices"] == []
+    assert all(c["selected"] for c in chunks)
+
+
+@pytest.mark.parametrize(
+    "n,expected",
+    [
+        (9, [4]),
+        (10, [4, 5]),
+        (12, [4, 5, 6, 7]),
+    ],
+)
+def test_n_over_8_takes_first_four_and_last_four(n: int, expected: list[int]) -> None:
+    """§6.5：N > 8 固定选前 4 与后 4。"""
+    chunks = _exact_chunks(n)
+    assert chunks[0]["selected_chunks"] == MAX_SELECTED_CHUNKS
+    assert chunks[0]["omitted_chunks"] == n - MAX_SELECTED_CHUNKS
+    assert chunks[0]["omitted_indices"] == expected
+
+
+@pytest.mark.parametrize("n", [9, 10, 11, 17, 50])
+def test_selection_is_exactly_eight_and_never_overlaps(n: int) -> None:
+    """N>8 时前 4 与后 4 必然不重叠（2*4=8<N），选出恰好 8 个互异 ordinal。"""
+    selected = [c["ordinal"] for c in _exact_chunks(n) if c["selected"]]
+    assert len(selected) == MAX_SELECTED_CHUNKS
+    assert len(set(selected)) == MAX_SELECTED_CHUNKS
+
+
+def test_selected_chunks_are_never_empty() -> None:
+    """§6.5：selected chunk 不得为空。"""
+    for n in (1, 9, 20):
+        for chunk in _exact_chunks(n):
+            assert chunk["end"] > chunk["start"]
+            if chunk["selected"]:
+                assert chunk["text"] != ""
+
+
+def test_omitted_chunks_are_metadata_only() -> None:
+    """§6.5：omitted chunk 只保留元数据——不携带正文。"""
+    for chunk in _exact_chunks(9):
+        if not chunk["selected"]:
+            assert chunk["text"] == ""
+        else:
+            assert chunk["text"] != ""
+
+
+def test_omitted_chunk_keeps_real_digest_for_verifiability() -> None:
+    """摘要不是正文：omitted chunk 仍记录真实 text_sha256，可校验内容身份。"""
+    doc = "a" * (9 * MAX_CHARS_PER_CHUNK)
+    index = build_section_index(doc)
+    chunks = chunk_sections(index, doc)
+    omitted = next(c for c in chunks if not c["selected"])
+    expected = "sha256:" + hashlib.sha256(
+        doc[omitted["start"] : omitted["end"]].encode()
+    ).hexdigest()
+    assert omitted["text_sha256"] == expected
+    assert omitted["text"] == ""
+
+
+def test_chunks_partition_section_without_gap_or_overlap() -> None:
+    """分块必须完整覆盖 section 且互不重叠（§6.5 不跨 section 合并）。"""
+    doc = "a" * (12 * MAX_CHARS_PER_CHUNK)
+    index = build_section_index(doc)
+    chunks = chunk_sections(index, doc)
+    record = index[0]
+    assert chunks[0]["start"] == record["start"]
+    assert chunks[-1]["end"] == record["end"]
+    for previous, current in zip(chunks, chunks[1:], strict=False):
+        assert previous["end"] == current["start"]
+
+
+def test_chunk_never_exceeds_max_chars_except_crlf_backoff() -> None:
+    """块长不超过 1024 code point（CRLF 回退只会更短）。"""
+    for n in (3, 9):
+        for chunk in _exact_chunks(n):
+            assert chunk["end"] - chunk["start"] <= MAX_CHARS_PER_CHUNK
+
+
+def test_max_chars_counts_code_points_not_bytes() -> None:
+    """§6.5：1024 按 Unicode code point 计数，不是字节。
+
+    中文字符 UTF-8 占 3 字节；若按字节计数，1024 个汉字会被切成多块。
+    """
+    doc = "中" * MAX_CHARS_PER_CHUNK
+    assert len(doc.encode("utf-8")) == MAX_CHARS_PER_CHUNK * 3
+    chunks = chunk_sections(build_section_index(doc), doc)
+    assert len(chunks) == 1
+    assert chunks[0]["end"] - chunks[0]["start"] == MAX_CHARS_PER_CHUNK
+    assert chunks[0]["text"] == doc
+
+
+def test_prefers_safe_boundary_over_hard_cut() -> None:
+    """§6.5：优先在最后一个换行或空白处切分，而非硬切。"""
+    body = "x" * (MAX_CHARS_PER_CHUNK - 10) + "\n" + "y" * 100
+    doc = body
+    chunks = chunk_sections(build_section_index(doc), doc)
+    assert len(chunks) == 2
+    # 第一块切在最后的换行之后，长度不足 1024
+    assert chunks[0]["end"] - chunks[0]["start"] < MAX_CHARS_PER_CHUNK
+    assert chunks[0]["text"].endswith("\n")
+
+
+def test_never_splits_crlf_across_chunks() -> None:
+    """§6.5：不能切断 CRLF。
+
+    不变式是「没有 chunk 以 \\r 结尾」——那正是 \\r 被与它的 \\n 拆散的标志。
+    安全切点落在 \\r 之前，CRLF 整体进入下一块（成为其块首），而非被劈开。
+    """
+    doc = "a" * (MAX_CHARS_PER_CHUNK - 1) + "\r\n" + "b" * 50
+    chunks = chunk_sections(build_section_index(doc), doc)
+    assert len(chunks) == 2
+    for chunk in chunks:
+        body = doc[chunk["start"] : chunk["end"]]
+        assert not body.endswith("\r"), "chunk 以 \\r 结尾意味着 CRLF 被切断"
+    # CRLF 仍以完整形态存在于某个块内
+    assert any("\r\n" in doc[c["start"] : c["end"]] for c in chunks)
+
+
+def test_hard_cut_used_when_no_safe_boundary() -> None:
+    """无空白可切时才在 1024 硬切。"""
+    doc = "a" * (2 * MAX_CHARS_PER_CHUNK + 7)
+    chunks = chunk_sections(build_section_index(doc), doc)
+    assert [c["end"] - c["start"] for c in chunks] == [
+        MAX_CHARS_PER_CHUNK,
+        MAX_CHARS_PER_CHUNK,
+        7,
+    ]
+
+
+def test_does_not_merge_across_sections() -> None:
+    """§6.5：分块单位是 SectionRecord，不跨 section 合并。"""
+    doc = "# A\n\n" + "a" * 2000 + "\n\n# B\n\n" + "b" * 2000 + "\n"
+    index = build_section_index(doc)
+    chunks = chunk_sections(index, doc)
+    assert {c["section_id"] for c in chunks} == {"S1", "S2"}
+    for chunk in chunks:
+        assert chunk["section_id"] in {"S1", "S2"}
+        # 每个 chunk 的区间必须落在自己 section 的范围内
+        owner = next(r for r in index if r["section_id"] == chunk["section_id"])
+        assert owner["start"] <= chunk["start"] < chunk["end"] <= owner["end"]
+
+
+def test_chunk_ids_are_unique() -> None:
+    """chunk_id 必须全局唯一，否则 batch plan 会串块。"""
+    doc = "# A\n\n" + "a" * 3000 + "\n\n# B\n\n" + "b" * 3000 + "\n"
+    chunks = chunk_sections(build_section_index(doc), doc)
+    ids = [c["chunk_id"] for c in chunks]
+    assert len(ids) == len(set(ids))
+    assert all(c["chunk_id"].startswith(c["section_id"]) for c in chunks)
+
+
+def test_chunk_line_numbers_are_monotonic_and_in_section() -> None:
+    """块行号必须落在所属 section 的行区间内且单调递增。"""
+    doc = "# A\n\n" + ("line\n" * 500) + "\n# B\n\n" + "x" * 2000 + "\n"
+    index = build_section_index(doc)
+    chunks = chunk_sections(index, doc)
+    by_section: dict[str, list] = {}
+    for chunk in chunks:
+        by_section.setdefault(chunk["section_id"], []).append(chunk)
+    for section_id, group in by_section.items():
+        owner = next(r for r in index if r["section_id"] == section_id)
+        lines = [c["start_line"] for c in group]
+        assert lines == sorted(lines)
+        for chunk in group:
+            assert owner["start_line"] <= chunk["start_line"] <= chunk["end_line"] <= owner[
+                "end_line"
+            ]
+
+
+def test_crlf_section_chunk_line_numbers() -> None:
+    """CRLF 文档的块行号按逻辑行计算，且不因 CRLF 被误计为两次换行。
+
+    `# A\\r\\n` 自带一个安全切点（末尾空白），故本例是 3 块而非 2 块。
+    末尾的 \\r\\n 不开启新行，故后两块同属正文那一行。
+    """
+    doc = "# A\r\n" + "a" * 1034 + "\r\n"
+    chunks = chunk_sections(build_section_index(doc), doc)
+    assert len(chunks) == 3
+    assert (chunks[0]["start_line"], chunks[0]["end_line"]) == (1, 1)
+    assert (chunks[1]["start_line"], chunks[1]["end_line"]) == (2, 2)
+    assert (chunks[2]["start_line"], chunks[2]["end_line"]) == (2, 2)
+
+
+def test_empty_document_yields_no_chunks() -> None:
+    """空文档的 S1 是零宽的，不应产出空 chunk。"""
+    doc = ""
+    assert chunk_sections(build_section_index(doc), doc) == []
+
+
+def test_selection_counters_are_consistent_on_every_chunk() -> None:
+    """§6.5：total/selected/omitted 必须逐块一致，供 batch plan 与 trace 使用。"""
+    for n in (1, 8, 9, 13):
+        chunks = _exact_chunks(n)
+        for chunk in chunks:
+            assert chunk["total_chunks"] == n
+            assert chunk["selected_chunks"] == len(
+                [c for c in chunks if c["selected"]]
+            )
+            assert chunk["omitted_chunks"] == n - chunk["selected_chunks"]
+            assert chunk["omitted_indices"] == [
+                c["ordinal"] for c in chunks if not c["selected"]
+            ]

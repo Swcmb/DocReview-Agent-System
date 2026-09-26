@@ -104,6 +104,9 @@ class AgentState(TypedDict):
     error_message: str | None
     total_llm_cost: float
     messages: Annotated[list, add_messages]
+    # §12.2：thread_id 只生成一次并写回 state，后续 finalize 复用。
+    # 入口为空串，由 history_store 在首次落盘时填充。
+    thread_id: str
 
 
 SEVERITY_BLOCKING = "Blocking"

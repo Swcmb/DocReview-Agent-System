@@ -17,7 +17,6 @@
 """
 
 import asyncio
-import json
 import logging
 import os
 import shutil
@@ -33,6 +32,7 @@ from ..config import AppConfig
 from ..mcp.context7 import Context7Client
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import AgentState
+from ..state.history_store import save_review_history
 from ..state.issue_fingerprint import fingerprint_set
 from .review_routing import (
     has_unresolved_blocking as has_unresolved_blocking,
@@ -148,6 +148,11 @@ async def initialize(state: AgentState) -> AgentState:
     }
     state["spec_snapshot"] = ""
     state["total_llm_cost"] = state.get("total_llm_cost", 0.0)
+
+    # §12.2：thread_id 在入口**只生成一次**并写回 state，后续 finalize 复用。
+    # 旧实现每次落盘都按秒重算 ID，同一秒内两次落盘会互相覆盖。
+    if not state.get("thread_id"):
+        state["thread_id"] = f"review-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs("reviews", exist_ok=True)
@@ -367,30 +372,18 @@ def _prune_review_history(state: AgentState) -> None:
 
 
 def _save_review_history(state: AgentState) -> None:
-    """序列化审查历史到磁盘
+    """序列化审查历史到磁盘（T-16：委托给 `history_store`）。
 
-    Args:
-        state: 当前工作流状态
+    落盘协议由 `src/state/history_store.py` 承担：thread_id 只生成一次、
+    `specification_snapshots` 去重、per-thread ``O_EXCL`` 锁、原子替换。
+
+    这里刻意**吞掉**落盘异常：history 写失败不应让一次已完成的审查整体崩掉。
+    库函数 `save_review_history()` 本身按 §12.2 显式抛出（锁超时／legacy 碰撞），
+    需要感知失败的调用方与测试直接调它。
     """
     try:
-        thread_id = f"review-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        output = {
-            "thread_id": thread_id,
-            "spec_version": state.get("spec_version", 1),
-            "specification": state.get("specification", ""),
-            "review_conclusion": state.get("review_conclusion", "unknown"),
-            "total_llm_cost": state.get("total_llm_cost", 0),
-            "reports": state.get("review_reports", [])
-        }
-
-        os.makedirs("reviews", exist_ok=True)
-        output_path = f"reviews/history-{thread_id}.json"
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, ensure_ascii=False, indent=2)
-
+        output_path = save_review_history(state)
         logger.info(f"审查历史已保存: {output_path}")
-
     except Exception as e:
         logger.error(f"保存审查历史失败: {e}")
 

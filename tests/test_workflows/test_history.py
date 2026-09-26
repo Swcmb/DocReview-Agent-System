@@ -30,6 +30,8 @@ from src.workflows.review_workflow import (
 
 # ─────────────────────────── 夹具 ───────────────────────────
 
+# T-16（§12.2）：保留 Step 0 的 6 个键，并补齐 thread_id / snapshots /
+# report_markdown / laya_findings / laya_trace / iteration_count / error_code。
 HISTORY_KEYS = {
     "thread_id",
     "spec_version",
@@ -37,6 +39,12 @@ HISTORY_KEYS = {
     "review_conclusion",
     "total_llm_cost",
     "reports",
+    "specification_snapshots",
+    "report_markdown",
+    "laya_findings",
+    "laya_trace",
+    "iteration_count",
+    "error_code",
 }
 
 
@@ -70,7 +78,10 @@ def _mk_report(iteration: int, severities: list[str] | None = None) -> ReviewRep
 
 
 def _history_files(root: Path) -> list[Path]:
-    return sorted((root / "reviews").glob("history-review-*.json"))
+    # T-16：thread_id 既可能是入口生成的 `review-<时间戳>`，也可能是 legacy fallback
+    # 的 `legacy-<16 hex>`，因此 glob 放宽到 `history-*.json`；`.lock` 与 `.tmp.*`
+    # 不匹配该模式，无需额外排除。
+    return sorted((root / "reviews").glob("history-*.json"))
 
 
 # ─────────────── `_prune_review_history`：压缩策略 ───────────────
@@ -202,8 +213,40 @@ def test_save_writes_expected_file_and_keys(monkeypatch, tmp_path):
     assert len(payload["reports"]) == 1
 
 
-def test_save_filename_embeds_generated_thread_id(monkeypatch, tmp_path):
-    """不变量：文件名与 `thread_id` 字段均为内部生成的 `review-YYYYMMDD-HHMMSS`。"""
+def test_save_embeds_thread_id_from_state_when_present(monkeypatch, tmp_path):
+    """T-16：state 已有 thread_id 时必须复用，文件名与该 ID 一致。"""
+    monkeypatch.chdir(tmp_path)
+    _save_review_history(
+        _state(review_reports=[_mk_report(1)], thread_id="review-20260101-000000")
+    )
+
+    path = _history_files(tmp_path)[0]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert path.name == "history-review-20260101-000000.json"
+    assert payload["thread_id"] == "review-20260101-000000"
+
+
+def test_save_reuses_same_thread_id_across_repeated_saves(monkeypatch, tmp_path):
+    """T-16 修掉 Step 0 缺陷：thread_id 只生成一次，重复落盘不再互相覆盖。
+
+    旧实现每次按秒重算 ID，同一秒内两次落盘会写进同一个文件——后写的覆盖先写的。
+    """
+    monkeypatch.chdir(tmp_path)
+    state = _state(review_reports=[_mk_report(1)])
+
+    _save_review_history(state)
+    first = _history_files(tmp_path)[0]
+    _save_review_history(state)
+
+    files = _history_files(tmp_path)
+    assert len(files) == 1, "同一 thread 重复落盘必须命中同一文件，不得产生第二个 history"
+    assert files[0] == first
+    assert state["thread_id"].startswith("legacy-"), "缺 ID 时走 legacy fallback 并写回 state"
+
+
+def test_save_falls_back_to_legacy_id_without_state_thread_id(monkeypatch, tmp_path):
+    """T-16：state 与 resume config 都无 ID 时，legacy fallback 产出 `legacy-<16 hex>`。"""
     monkeypatch.chdir(tmp_path)
     _save_review_history(_state(review_reports=[_mk_report(1)]))
 
@@ -212,22 +255,19 @@ def test_save_filename_embeds_generated_thread_id(monkeypatch, tmp_path):
 
     assert path.name == f"history-{payload['thread_id']}.json"
     thread_id = payload["thread_id"]
-    assert thread_id.startswith("review-")
-    assert len(thread_id) == len("review-YYYYMMDD-HHMMSS")
+    assert thread_id.startswith("legacy-")
+    assert len(thread_id) == len("legacy-") + 16
 
 
-def test_save_ignores_thread_id_in_state(monkeypatch, tmp_path):
-    """不变量（**已知设计取舍**）：`thread_id` 取自系统时间而非 state。
-
-    传入自定义 thread_id 不会体现在输出中——同一秒内两次落盘会互相覆盖。
-    """
+def test_save_prefers_resume_config_thread_id_over_legacy(monkeypatch, tmp_path):
+    """T-16：resume config 里的 ID 优先于 legacy fallback。"""
     monkeypatch.chdir(tmp_path)
-    state = _state(review_reports=[_mk_report(1)])
-
-    _save_review_history(state)
+    _save_review_history(
+        _state(review_reports=[_mk_report(1)], resume_config={"thread_id": "resumed-42"})
+    )
 
     payload = json.loads(_history_files(tmp_path)[0].read_text(encoding="utf-8"))
-    assert payload["thread_id"].startswith("review-")
+    assert payload["thread_id"] == "resumed-42"
 
 
 def test_save_applies_defaults_for_missing_keys(monkeypatch, tmp_path):

@@ -71,7 +71,8 @@ def create_initial_state() -> dict[str, Any]:
         "error_code": None,
         "error_message": None,
         "total_llm_cost": 0.0,
-        "messages": []
+        "messages": [],
+        "thread_id": "",
     }
 
 

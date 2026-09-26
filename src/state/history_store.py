@@ -25,6 +25,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -42,7 +43,9 @@ __all__ = [
     "LOCK_TIMEOUT_SECONDS",
     "HistoryLockTimeoutError",
     "LegacyIdCollisionError",
+    "THREAD_ID_RANDOM_LENGTH",
     "content_sha256",
+    "new_thread_id",
     "legacy_thread_id",
     "build_specification_snapshots",
     "thread_lock",
@@ -89,6 +92,31 @@ class LegacyIdCollisionError(RuntimeError):
 def content_sha256(content: str) -> str:
     """规格正文的 UTF-8 原始字节摘要（无 BOM、无换行规范化）。"""
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+#: thread_id 随机后缀长度（十六进制字符）。6 位 = 16^6 ≈ 1677 万，同一秒内
+#: 两次运行的碰撞概率已可忽略；再长只会让文件名变长，不增加实质安全性。
+THREAD_ID_RANDOM_LENGTH = 6
+
+
+def new_thread_id() -> str:
+    """生成新的 thread ID：``review-<YYYYMMDD-HHMMSS>-<6 位随机十六进制>``。
+
+    §12.2 要求 thread_id 在**入口只生成一次**并被 state / checkpoint / history /
+    audit / CLI 复用。纯秒级时间戳不够：同一秒内启动两次审查会得到同一个 ID，
+    于是第二次的 checkpoint 覆盖第一次、history 互相覆盖，且从外部完全看不出
+    发生了覆盖。随机后缀把这件事的概率压到可忽略。
+
+    刻意用 :mod:`secrets` 而非 :mod:`random`——ID 会进文件路径，不是安全边界，
+    但没有理由引入一个可预测的 PRNG。
+
+    格式保持 ``review-`` 前缀与秒级时间戳段，``status`` / ``resume`` 的
+    ``--thread-id`` 用法与既有 history 文件命名（``history-<thread_id>.json``）
+    都不受影响。
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    suffix = secrets.token_hex(THREAD_ID_RANDOM_LENGTH // 2 + THREAD_ID_RANDOM_LENGTH % 2)
+    return f"review-{stamp}-{suffix[:THREAD_ID_RANDOM_LENGTH]}"
 
 
 def legacy_thread_id(state: Mapping[str, Any]) -> str:

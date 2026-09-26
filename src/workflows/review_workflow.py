@@ -21,7 +21,6 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -38,7 +37,7 @@ from ..decisions.factory import (
 from ..mcp.context7 import Context7Client
 from ..mcp.sequential_thinking import SequentialThinkingClient
 from ..schemas.models import AgentState
-from ..state.history_store import save_review_history
+from ..state.history_store import new_thread_id, save_review_history
 from ..state.issue_fingerprint import fingerprint_set
 from .review_routing import (
     has_unresolved_blocking as has_unresolved_blocking,
@@ -158,8 +157,10 @@ async def initialize(state: AgentState) -> AgentState:
 
     # §12.2：thread_id 在入口**只生成一次**并写回 state，后续 finalize 复用。
     # 旧实现每次落盘都按秒重算 ID，同一秒内两次落盘会互相覆盖。
+    # 用 new_thread_id() 而非裸时间戳：CLI 入口与本节点都会用到它，必须是同一
+    # 套生成规则；随机后缀进一步避免同秒并发启动的两次审查撞同一个 ID。
     if not state.get("thread_id"):
-        state["thread_id"] = f"review-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        state["thread_id"] = new_thread_id()
 
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs("reviews", exist_ok=True)
@@ -596,20 +597,39 @@ def _build_decision_provider(app_config: AppConfig) -> Any:
     return _factory
 
 
+def resolve_runtime_config(config: Any = None) -> AppConfig:
+    """把 ``create_workflow_runtime`` 的 ``config`` 参数解析成 :class:`AppConfig`。
+
+    §12.3 要求的兼容契约：
+
+    - ``None``：按现状构造 ``AppConfig()``（从环境读）。**刻意不改成
+      ``get_config()`` 单例**——那会改变「同进程内多次调用读到不同配置」这一
+      既有行为，超出本任务范围。
+    - ``AppConfig``：使用其**深拷贝**。CLI 的 ``--laya/--no-laya`` 正是靠这条
+      路径把开关送进决策层；不拷贝的话调用方的对象会被我们改掉，而它在别处
+      还要继续使用。
+    - ``dict``：旧调用方传的是 LangGraph 的 ``configurable`` dict，从来没有被
+      本函数消费过。为保持向后兼容，这里**继续忽略**它，而不是把它误当配置。
+    """
+    if isinstance(config, AppConfig):
+        return config.model_copy(deep=True)
+    return AppConfig()
+
+
 async def create_workflow_runtime(
-    config: Optional[Dict[str, Any]] = None
+    config: Any | None = None
 ) -> Dict[str, Any]:
     """创建工作流运行时环境
 
     初始化所有必要的组件并返回工作流实例
 
     Args:
-        config: 可选的配置字典
+        config: 可选的 :class:`AppConfig`；传 ``dict`` 会被忽略（旧调用方兼容）
 
     Returns:
         包含 workflow、agents、tools 等的字典
     """
-    app_config = AppConfig()
+    app_config = resolve_runtime_config(config)
 
     # ── 决策层接线（T-17b）────────────────────────────────────────────
     # 未启用时 `_build_decision_provider` 返回 None，`configure_provider(None)`

@@ -9,7 +9,9 @@
 所有断言写在测试体内（而非快照文件），以免被"重生成基线"顺手改掉。
 """
 
+import asyncio
 import json
+import re
 from typing import Any, cast
 
 import pytest
@@ -42,6 +44,8 @@ class _FakeWorkflow:
     def __init__(self, result: dict) -> None:
         self._result = result
         self.seen_config: Any = None
+        # T-18：`review` 传给 `create_workflow_runtime` 的 AppConfig 副本。
+        self.seen_runtime_config: Any = None
 
     async def ainvoke(self, state, config=None):
         self.seen_config = config
@@ -49,14 +53,29 @@ class _FakeWorkflow:
 
 
 def _stub_runtime(monkeypatch: pytest.MonkeyPatch, result: dict) -> _FakeWorkflow:
-    """接管 `create_workflow_runtime`，返回可断言的 workflow 替身。"""
+    """接管 `create_workflow_runtime`，返回可断言的 workflow 替身。
+
+    T-18 起 `review` 会传入一份 `AppConfig`（承载 `--laya/--no-laya` 的解析结果），
+    故替身必须能接受该位置参数，并把它记录下来供优先级断言使用。
+    """
     workflow = _FakeWorkflow(result)
 
-    async def _fake_create_runtime():
+    async def _fake_create_runtime(config: Any = None):
+        workflow.seen_runtime_config = config
         return {"workflow": workflow}
 
     monkeypatch.setattr(cli, "create_workflow_runtime", _fake_create_runtime)
     return workflow
+
+
+def asyncio_run(coro: Any) -> Any:
+    """同步驱动一个协程。
+
+    本文件是同步测试（`CliRunner` 也是同步的），但要直接测 `initialize` 这类
+    async 节点函数。没有封装的话每个用例都得写一遍 `asyncio.run` + 事件循环
+    清理，读起来噪音大于信息。
+    """
+    return asyncio.run(coro)
 
 
 # ─────────────────── 退出码常量本身 ───────────────────
@@ -92,11 +111,15 @@ def test_review_options_are_frozen():
         "spec_output",
         "no_mcp",
         "model",
+        "laya",
     }
     assert params["max_iterations"].default == 10
     assert params["output_dir"].default == "./reviews/"
     assert params["doc_path"].default is None
     assert params["no_mcp"].default is False
+    # T-18：三态开关。默认 None 表示「CLI 未表态」，必须与 False 区分——
+    # 否则 `--no-laya` 会被当成没传，从而回落到 LAYA__ENABLED。
+    assert params["laya"].default is None
 
 
 def test_generate_spec_options_are_frozen():
@@ -203,7 +226,9 @@ def test_review_builds_thread_id_and_passes_it(monkeypatch):
     assert result.exit_code == EXIT_SUCCESS
     thread_id = workflow.seen_config["configurable"]["thread_id"]
     assert thread_id.startswith("review-")
-    assert len(thread_id) == len("review-YYYYMMDD-HHMMSS")
+    # T-18：秒级时间戳后追加 6 位随机十六进制，否则同秒内两次启动会撞同一个
+    # ID，checkpoint 与 history 互相覆盖且外部看不出发生过覆盖。
+    assert re.fullmatch(r"review-\d{8}-\d{6}-[0-9a-f]{6}", thread_id)
 
 
 def test_review_propagates_system_error_exit_code(monkeypatch):
@@ -477,3 +502,215 @@ def test_config_path_is_echoed():
     with runner.isolated_filesystem():
         result = runner.invoke(cli.app, ["--config", "custom.yaml", "status"])
     assert "custom.yaml" in result.output
+
+
+# ─────────────────── T-18：Laya 开关优先级 ───────────────────
+
+
+def test_laya_defaults_to_false_when_env_also_absent(monkeypatch):
+    """§12.3：CLI 与 LAYA__ENABLED 都未表态时，默认 false。"""
+    monkeypatch.delenv("LAYA__ENABLED", raising=False)
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    workflow = _stub_runtime(monkeypatch, {"review_conclusion": "Pass"})
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert workflow.seen_runtime_config.laya.enabled is False
+
+
+def test_laya_reads_env_when_cli_absent(monkeypatch):
+    """§12.3：CLI 未表态 → 回落到 ``LAYA__ENABLED``。"""
+    monkeypatch.setenv("LAYA__ENABLED", "true")
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    workflow = _stub_runtime(monkeypatch, {"review_conclusion": "Pass"})
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert workflow.seen_runtime_config.laya.enabled is True
+
+
+def test_cli_laya_overrides_env(monkeypatch):
+    """§12.3：CLI > 环境。``--no-laya`` 必须能压住 ``LAYA__ENABLED=true``。"""
+    monkeypatch.setenv("LAYA__ENABLED", "true")
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    workflow = _stub_runtime(monkeypatch, {"review_conclusion": "Pass"})
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审", "--no-laya"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert workflow.seen_runtime_config.laya.enabled is False
+
+
+def test_cli_laya_overrides_env_false(monkeypatch):
+    """反向覆盖：``LAYA__ENABLED=false`` 时 ``--laya`` 仍能开启。"""
+    monkeypatch.setenv("LAYA__ENABLED", "false")
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    workflow = _stub_runtime(monkeypatch, {"review_conclusion": "Pass"})
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审", "--laya"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert workflow.seen_runtime_config.laya.enabled is True
+
+
+def test_laya_switch_is_mutually_exclusive():
+    """Typer 三态开关：正反形态分列 opts / secondary_opts，且共享一个 name。"""
+    review = _commands()["review"]
+    laya_param = {p.name: p for p in review.params}["laya"]
+    # Typer 把 `--x/--no-x` 的正向形态放 opts、反向放 secondary_opts；
+    # 两者共用同一个参数对象，所以「互斥」由 Typer 保证，不需要我们再断言
+    # 运行时冲突——这里只锁住「确实存在这一对形态」这一对外契约。
+    assert laya_param.opts == ["--laya"]
+    assert laya_param.secondary_opts == ["--no-laya"]
+
+
+# ─────────────────── T-18：thread_id 同源 ───────────────────
+
+
+def test_thread_id_is_shared_by_state_and_config(monkeypatch):
+    """§12.2：同一次审查的 state 与 checkpoint 必须用**同一个** thread_id。
+
+    旧实现里 CLI 和 workflow 的 initialize 节点各生成一个，两边可能不同——
+    checkpoint 用 CLI 的、history 用 workflow 的，事后无法对齐同一次审查。
+    """
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    seen: dict = {}
+
+    class _Capturing(_FakeWorkflow):
+        async def ainvoke(self, state, config=None):
+            seen["state"] = dict(state)
+            seen["config"] = config
+            return {"review_conclusion": "Pass"}
+
+    workflow = _Capturing({"review_conclusion": "Pass"})
+
+    async def _fake_create_runtime(config: Any = None):
+        return {"workflow": workflow}
+
+    monkeypatch.setattr(cli, "create_workflow_runtime", _fake_create_runtime)
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert seen["state"]["thread_id"] == seen["config"]["configurable"]["thread_id"]
+
+
+def test_thread_id_is_not_regenerated_by_initialize(monkeypatch):
+    """入口写好的 thread_id 必须被 initialize 原样保留（不重算）。"""
+    from src.schemas.models import AgentState
+    from src.state.agent_state import create_initial_state
+    from src.workflows.review_workflow import initialize
+
+    state: AgentState = create_initial_state()
+    state["thread_id"] = "review-20260926-101010-abc123"
+
+    asyncio_run(initialize(state))
+
+    assert state["thread_id"] == "review-20260926-101010-abc123"
+
+
+def test_initialize_generates_random_suffixed_thread_id(monkeypatch):
+    """未预设时，initialize 用 new_thread_id() 生成带随机后缀的 ID。"""
+    from src.state.agent_state import create_initial_state
+    from src.workflows.review_workflow import initialize
+
+    monkeypatch.setattr("src.workflows.review_workflow.DATA_DIR", "data")
+    state = create_initial_state()
+
+    asyncio_run(initialize(state))
+
+    assert re.fullmatch(r"review-\d{8}-\d{6}-[0-9a-f]{6}", state["thread_id"])
+
+
+def test_two_thread_ids_in_same_second_differ(monkeypatch):
+    """同秒内连续生成的两个 ID 必须不同（随机后缀的存在理由）。"""
+    from src.state.history_store import new_thread_id
+
+    ids = {new_thread_id() for _ in range(20)}
+    assert len(ids) == 20
+
+
+# ─────────────────── T-18：结构化摘要 ───────────────────
+
+
+def test_summary_reads_structured_laya_findings(monkeypatch):
+    """§12.3：摘要读结构化 findings，不解析 Markdown。"""
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    _stub_runtime(
+        monkeypatch,
+        {
+            "review_conclusion": "Pass",
+            "laya_findings": [
+                {
+                    "finding_id": "screen-1",
+                    "kind": "screen",
+                    "severity": "warning",
+                    "message": "缺少错误码定义",
+                    "source": "laya",
+                    "decision_ids": [],
+                }
+            ],
+        },
+    )
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert "缺少错误码定义" in result.output
+    assert "screen" in result.output
+
+
+def test_summary_absent_findings_is_not_an_error(monkeypatch):
+    """决策层没跑（无 laya_findings 键）时摘要降级说明，且退出码不受影响。"""
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    _stub_runtime(monkeypatch, {"review_conclusion": "Pass"})
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert "决策层" in result.output
+
+
+def test_summary_ignores_report_markdown(monkeypatch):
+    """回归守卫：摘要不得从 report_markdown 里刨内容。"""
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    _stub_runtime(
+        monkeypatch,
+        {"review_conclusion": "Pass", "report_markdown": "MARKDOWN_CANARY_未被结构化收集"},
+    )
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert "MARKDOWN_CANARY" not in result.output
+
+
+# ─────────────────── T-18：落盘失败必须非零退出 ───────────────────
+
+
+def test_error_code_in_result_exits_nonzero(monkeypatch):
+    """审查报错时即便结论是 Pass 也必须非零退出。"""
+    monkeypatch.setattr(cli, "_check_api_key", lambda: True)
+    _stub_runtime(
+        monkeypatch,
+        {
+            "review_conclusion": "Pass",
+            "error_code": "DOCREVIEW_ERR_LLM_008",
+            "error_message": "预算超限",
+        },
+    )
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.app, ["review", "--task", "评审"])
+
+    assert result.exit_code == EXIT_SYSTEM_ERROR
+    assert "DOCREVIEW_ERR_LLM_008" in result.output

@@ -109,7 +109,6 @@ checkpoint_manifest_sha256 = sha256:bcfe05afe818705a46dd27de5d8a334544813d278410
 `rl_agent_config.json` 497 B、`tokenizer.json` 34363188 B 等）。
 
 ## 6. 已发现的规格不一致（`runtime_source_digest`）
-
 **现象**：按 §7（spec L1077）算法重算得到的
 `runtime_source_digest = sha256:df86aa6f4621577cfcfd320d3237b8462c0593f0e3a99c2351bac234ff095ede`，
 与规格 §9.1／§9.2／§9.3 示例 JSON 中写的
@@ -132,3 +131,91 @@ checkpoint_manifest_sha256 = sha256:bcfe05afe818705a46dd27de5d8a334544813d278410
 
 运行时以本文件 §4 实测值为准；`runtime_source_digest` 参与 calibration 绑定，
 **必须**由实际 source tree 重算，不得采信任何硬编码示例值。
+
+## 7. T-02b 硬闸门：实际在 `laya` conda 环境执行（与 §7.1 的偏离，已获用户批准）
+
+### 7.1 实测结果
+
+T-02b（真实权重 + `noul`/`choice`/`score` 三题型均返回有限 `answer_confidence`）
+在 **`laya` conda 环境**通过：**9 passed**。三题型实测（真实权重，严格离线）：
+
+| primitive | `answer_confidence` | 载荷 |
+|---|---|---|
+| `noul` | 0.6322 | `noul=0.3678` |
+| `choice` | 0.9948 | `choice='refund'`（命中正确） |
+| `score` | 0.7614 | `score=2.7142`（0–3 档内） |
+
+### 7.2 为什么不在 `default` 环境跑
+
+`default` 环境的 `torchvision 0.22.1` 与 `torch 2.14.0+cpu` **ABI 不匹配**，
+导致 `import torchvision` 直接失败：
+
+```
+RuntimeError: operator torchvision::nms does not exist
+```
+
+`transformers.image_utils` 用 `if is_torchvision_available():` 守卫导入 torchvision；
+由于 torchvision「已安装」（哪怕已损坏），守卫为真 → 触发失败 →
+`transformers.loss` → 整个 Laya 导入链崩溃。这是 `default` 环境的**既有潜伏缺陷**
+（现有 233 项测试无一 import torchvision，故此前未暴露），**非本次改动引入**。
+
+规格 T-02b 授权的 remedy 是「在 `default` 环境降级 `transformers` 到 4.x」，
+但本故障是 torch/torchvision **ABI 不匹配**，不是 transformers API 差异，
+降级 transformers 无法修复。
+
+### 7.3 两个环境的差异
+
+| | `default`（规格原指定） | `laya`（T-02b 实际使用） |
+|---|---|---|
+| Python | 3.13.9 | 3.12.14 |
+| torch | `2.14.0+cpu` | `2.14.0+cu130` |
+| torchvision | `0.22.1`（**已损坏**） | `0.29.0+cu130` ✅ 配对 |
+| transformers | 5.6.2 | 5.17.0 |
+| laya | 0.3.20 | 0.3.20 |
+
+`laya` 环境是**已存在的**环境，非为本次新建。
+
+### 7.4 对 T-03+ 的架构影响（重要）
+
+规格 §7.1 要求「统一解释器」、§328 要求「**进程内运行**」。既然 Laya 真实推理
+**只能在 `laya` 环境发生**，则：
+
+- **T-03+ 的决策层不能假设在 `default` 进程内 import Laya**——`default` 里
+  `import laya` 会在加载权重时崩溃。
+- 决策层需要显式处理「Laya 在独立环境」这一事实：要么以子进程调用 `laya` 环境，
+  要么整个 DocReview 运行时改用 `laya` 环境。
+- **在取得合规 calibration 之前，所有 Laya 判定恒为 `uncertain`**（§0.2／§2150），
+  端到端行为与「未接入 Laya」一致——这是规格的正确行为，不是缺陷。
+
+### 7.5 未校准温度告警（须留意）
+
+冒烟时 Laya 输出：
+
+```
+RuntimeWarning: this checkpoint ships invalid temperatures ... choice:11+=0.1005... -> 0.5
+Treat confidence from the affected entries as uncalibrated.
+```
+
+`choice` 题型的部分置信度来自**未校准**条目。T-02b 的判据只看「是否有限」，
+故闸门通过；但按 §11.1，阈值只能来自 calibration manifest、且 `LayaConfig`
+不得覆盖阈值，故 `choice` 的业务判定在合规 calibration 到位前必须保持 `uncertain`。
+
+### 7.6 运行方式
+
+```powershell
+$lpython = "D:\ProgramFiles\anaconda3\envs\laya\python.exe"
+$env:LAYA__MODEL = "multilingual"
+$env:LAYA__DEVICE = "cpu"
+$env:LAYA__MODEL_DIR = "D:\DocReviewer\laya-huggingface"
+$env:LAYA__CHECKPOINT_MANIFEST_PATH = "D:\DocReviewer\config\laya-checkpoint-manifest.json"
+$env:LAYA__CALIBRATION_PATH = "D:\DocReviewer\config\laya-calibration.json"
+& $lpython -m pytest tests/test_decisions/test_laya_integration.py -m laya_integration -q --noconftest
+```
+
+`--noconftest` 用于跳过项目 `tests/conftest.py`（它 import `src.utils.llm`，
+与本闸门无关，且 `laya` 环境无 DocReview 依赖）。闸门用例自包含所需 fixture。
+
+`pyproject.toml` 的 `addopts` 已设 `-m "not laya_integration"`，使全量套件
+**默认不收集**闸门（避免 `default` 环境误报 9 个 error）；显式
+`-m laya_integration` 仍可触发，且**缺前置时大声失败**（不 skip），
+符合 T-02b「不允许记录后继续」的要求。

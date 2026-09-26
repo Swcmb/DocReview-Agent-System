@@ -62,9 +62,12 @@ addopts = [
     "-v",
     "--tb=short",
     "--strict-markers",
+    "-m",
+    "not laya_integration",
 ]
 markers = [
     "asyncio: mark a test as an asyncio test",
+    "laya_integration: 需真实 Laya 权重的集成测试（T-02b 硬闸门，默认不随全量套件运行）",
 ]
 
 [tool.coverage.run]

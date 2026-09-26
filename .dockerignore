@@ -26,6 +26,28 @@ reviews/history-*.json
 *.db-journal
 *.db.bak
 
+# 规格 T-19：默认镜像不安装 Laya、不携带权重。
+# torch/transformers 属 Laya 依赖，默认镜像不得包含。
+laya-github/
+laya-huggingface/
+*.safetensors
+*.bin
+*.pt
+*.onnx
+*.ckpt
+*.model
+
+# Laya 脚本与权重清单无需进镜像
+scripts/probe_laya_runtime.py
+scripts/calibrate_laya.py
+scripts/eval_laya_decisions.py
+scripts/build_laya_checkpoint_manifest.py
+
+# 本地工作区文档（规格 / 状态 / 计划），非运行时依赖
+claude-context/
+.omo/
+specs/laya/
+
 # IDE / Editor
 .vscode/
 .idea/

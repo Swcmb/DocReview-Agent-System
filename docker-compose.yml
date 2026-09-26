@@ -1,9 +1,10 @@
 # DocReview Agent System — Docker Compose
 # 用法:
-#   docker compose build                     # 构建镜像
-#   docker compose up -d docreview-server    # 启动 HTTP MCP Server
-#   docker compose run --rm docreview-test   # 运行测试
-#   docker compose down                      # 停止并清理
+#   docker compose build                          # 构建镜像
+#   docker compose up -d docreview-server         # 启动 HTTP MCP Server
+#   docker compose run --rm docreview-test        # 运行测试
+#   docker compose --profile rss run --rm docreview-rss   # 固定 mock 内存测量（T-19）
+#   docker compose down                           # 停止并清理
 
 services:
   # ---- HTTP MCP Server（主服务） ----
@@ -30,6 +31,21 @@ services:
       - LOG_LEVEL=WARNING
     profiles:
       - test
+
+  # ---- 固定 mock 内存测量（规格 T-19，容器峰值 < 500MB）----
+  # 两道闸门都要：
+  #   1. mem_limit 由 Docker 强制，超限即 OOM kill → 容器非零退出；
+  #   2. 脚本内再读进程峰值 RSS 并比对阈值。
+  # 只跑第 1 道无法区分「刚好达标」和「测量本身失败」，故两道并存。
+  docreview-rss:
+    build: .
+    container_name: docreview-rss
+    entrypoint: ["python", "scripts/measure_peak_rss.py", "--json"]
+    environment:
+      - LOG_LEVEL=WARNING
+    mem_limit: 500m
+    profiles:
+      - rss
 
 volumes:
   docreview-data:

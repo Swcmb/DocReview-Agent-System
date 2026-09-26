@@ -30,6 +30,9 @@ COPY specs/ specs/
 COPY docs/ docs/
 COPY examples/ examples/
 COPY tests/ tests/
+# scripts/ 供 T-19 固定 mock 内存测量入口使用；.dockerignore 已排除其中的
+# Laya 探针/校准脚本（它们需要 torch，不属于默认镜像）。
+COPY scripts/ scripts/
 
 # ---- 安装 Python 依赖（含开发/测试依赖） ----
 RUN pip install --no-cache-dir ".[dev]"

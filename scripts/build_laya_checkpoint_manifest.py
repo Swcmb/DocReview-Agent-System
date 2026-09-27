@@ -37,6 +37,8 @@ WEIGHTS_FILE = "model.safetensors"
 AGENT_CONFIG_FILE = "rl_agent_config.json"
 CHECKSUM_PREFIX = "sha256:"
 READ_CHUNK = 1024 * 1024
+# 仓库根目录：scripts/ 的上一级。用于定位 vendored 的 laya/ 快照。
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # §7.3：model -> 相对 bundle 根的 checkpoint 子目录。english 即 bundle 根本身。
 MODEL_SUBDIR: dict[str, str] = {
@@ -161,17 +163,39 @@ def assert_behavior_coverage(root: Path, entries: list[dict[str, Any]]) -> None:
 
 
 def read_runtime_commit(laya_source: Path) -> str:
-    """从 Laya 源码仓读取 HEAD 作为 `runtime_commit`（§9.2 权威 commit）。"""
+    """解析 `runtime_commit`（§9.2 权威 commit）。
+
+    两种来源，按 `laya_source` 是否为独立 git 仓自动判别：
+
+    1. **独立 laya 克隆**（根下有 `.git`）→ 取其 `HEAD`，即上游 commit。
+    2. **本仓库的 vendored 快照**（`laya/`，无 `.git`）→ 取本仓库中最后
+       触及该路径的提交，即引入/更新该快照的 commit。
+
+    不可对 vendored 目录直接跑 `git -C <dir> rev-parse HEAD`：它是本仓库的
+    子目录，该命令会返回**本仓库 HEAD**，与 laya 快照的来源无关。
+    """
+    if (laya_source / ".git").exists():
+        cmd = ["git", "-C", str(laya_source), "rev-parse", "HEAD"]
+    else:
+        cmd = [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "log",
+            "-1",
+            "--format=%H",
+            "--",
+            str(laya_source),
+        ]
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(laya_source), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ManifestError(f"无法读取 Laya runtime commit：{exc}") from exc
-    return proc.stdout.strip()
+
+    commit = proc.stdout.strip()
+    if not commit:
+        raise ManifestError(f"未能解析 Laya runtime commit（来源：{laya_source}）")
+    return commit
 
 
 def load_cache(path: Path | None) -> dict[str, Any] | None:
@@ -284,7 +308,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-dir", required=True, type=Path, help="权重 bundle 根目录")
     parser.add_argument("--model", required=True, choices=sorted(MODEL_SUBDIR), help="逻辑模型名")
     parser.add_argument("--output", required=True, type=Path, help="manifest 输出路径（必须在 bundle 外）")
-    parser.add_argument("--laya-source", type=Path, default=Path(r"D:\DocReviewer\laya-github"), help="Laya 源码仓")
+    parser.add_argument(
+        "--laya-source",
+        type=Path,
+        default=REPO_ROOT / "laya",
+        help="Laya 源码来源：默认本仓库 vendored 快照；传入独立 laya 克隆则取其 HEAD",
+    )
     parser.add_argument("--digest-cache", type=Path, default=None, help="摘要缓存 JSON（按 path/size/mtime_ns 失效）")
     parser.add_argument("--verify", action="store_true", help="只验证既有 manifest，不写出")
     args = parser.parse_args(argv)

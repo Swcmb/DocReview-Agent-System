@@ -27,6 +27,8 @@ reviews/history-*.json
 *.db
 *.db-journal
 *.db.bak
+# 规格与任务状态（项目约定不纳入版本控制）
+claude-context/
 
 # 系统
 .DS_Store

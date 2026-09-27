@@ -120,6 +120,11 @@ docreview resume --thread-id review-20260520-140010 --approve
 | 3 | `EXIT_USER_ABORT` | 用户中断 |
 | 4 | `EXIT_INVALID_ARGS` | 参数非法 |
 
+> ⚠️ **2 号码存在歧义**：Typer/Click 的**用法错误**（缺必填参数、未知子命令）也固定返回 `2`，
+> 与 `EXIT_SYSTEM_ERROR` 撞号。脚本里判断"是参数问题还是系统异常"不能只看退出码，
+> 需结合 stderr 是否为 `Usage:` 提示。实测：`docreview resume`（缺 `--thread-id`）→ `2`（Click），
+> 而 `docreview review`（缺 `--doc-path` 与 `--task`）→ `4`（项目自身校验）。
+
 ### MCP Server（HTTP 模式）
 
 ```bash

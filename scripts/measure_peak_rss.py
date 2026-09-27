@@ -117,8 +117,11 @@ def _peak_rss_mb() -> float:
     import resource
 
     raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Linux: KiB；Darwin: bytes。其余 Unix 按 KiB 处理（与 Linux 同源）。
-    divisor = 1024.0 if sys.platform == "darwin" else 1024.0 * 1024.0
+    # Linux/其余 Unix: ru_maxrss 单位是 KiB → MB 除 1024
+    # Darwin: 单位是 bytes → MB 除 1024**2
+    # 这两个分支曾写反（darwin 除 1024、Linux 除 1024**2），使容器内真实 ~72MB
+    # 被报成 ~0.06MB：500MB 闸门因此永不触发，等于没有闸门。
+    divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
     return raw / divisor
 
 

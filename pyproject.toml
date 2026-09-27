@@ -50,7 +50,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+# laya 为 vendored 的第三方包（Apache-2.0，见 third_party/laya/NOTICE.md）。
+# 必须以顶层包名 laya 分发：其 router.py / structured.py 存在绝对自引用导入
+# `import laya`，改名或下沉为子包会让那些导入解析到别处，造成 split-brain。
+packages = ["src", "laya"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -91,6 +94,9 @@ exclude_lines = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+# vendored 第三方代码（Apache-2.0，见 third_party/laya/NOTICE.md）不纳入本项目 lint 闸门：
+# 它不是我们的维护责任，且「顺手修上游」会制造分叉、破坏 NOTICE 承诺的未修改快照。
+extend-exclude = ["laya"]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings

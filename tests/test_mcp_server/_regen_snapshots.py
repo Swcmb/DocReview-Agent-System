@@ -16,45 +16,22 @@
 import asyncio
 import json
 
+import pytest
+
+from tests.test_mcp_server import test_contract as tc
 from tests.test_mcp_server.test_contract import SNAP_DIR, collect_snapshots
 
 
-class _Stubs:
-    """就地安装替身（生成器不是 pytest，没有 monkeypatch 可用）。"""
-
-    def __enter__(self) -> None:
-        from tests.test_mcp_server import test_contract as tc
-
-        self._http = tc.http_srv
-        self._stdio = tc.stdio_srv
-        self._saved = (
-            self._http._runtime_cache,
-            self._stdio._runtime_cache,
-            self._http.run_review_workflow,
-            self._stdio.run_review_workflow,
-        )
-        runtime = {
-            "seq_thinking": tc._NotDegraded(),
-            "context7": tc._NotDegraded(),
-            "supervisor": tc._FakeSupervisor(),
-        }
-        self._http._runtime_cache = runtime
-        self._stdio._runtime_cache = runtime
-        self._http.run_review_workflow = tc._fake_run_review_workflow
-        self._stdio.run_review_workflow = tc._fake_run_review_workflow
-
-    def __exit__(self, *exc: object) -> None:
-        (
-            self._http._runtime_cache,
-            self._stdio._runtime_cache,
-            self._http.run_review_workflow,
-            self._stdio.run_review_workflow,
-        ) = self._saved
-
-
 async def main() -> None:
-    with _Stubs():
-        snapshots = await collect_snapshots()
+    # 直接实例化 MonkeyPatch（无需 pytest 运行即可用），从而复用
+    # `test_contract._install_stubs` 单一替身定义——避免此处再复制一份
+    # runtime 字典而与测试侧漂移（历史上正是这类重复导致基线与测试不一致）。
+    mp = pytest.MonkeyPatch()
+    try:
+        tc._install_stubs(mp)
+        snapshots = await collect_snapshots(mp)
+    finally:
+        mp.undo()
 
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
     for name, payload in sorted(snapshots.items()):

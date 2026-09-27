@@ -1,0 +1,8 @@
+{
+  "llm_available": false,
+  "mcp_services": {
+    "context7": true,
+    "sequential_thinking": true
+  },
+  "status": "healthy"
+}

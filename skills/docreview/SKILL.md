@@ -53,8 +53,9 @@ docreview resume --thread-id review-20260520-140010 --approve
 **标准 MCP 客户端现在可以连 HTTP 模式**：发 `initialize` / `tools/list` / `tools/call`
 即可，返回形态与 stdio 逐字段一致。旧方法名与返回形态原样保留，老客户端零影响。
 
-> HTTP 侧仍非完整 MCP Streamable HTTP 传输（无 GET SSE、无会话管理）；
-> 强依赖这两项的客户端请改用 stdio 模式。
+HTTP 模式另提供规范 Streamable 端点 `/mcp`：`POST`（握手，回传 `Mcp-Session-Id`）、
+`GET`（SSE 保活流）、`DELETE`（终结会话）。非 `initialize` 请求必须带会话头，否则 400。
+**会话只在进程内存**，服务重启后需重新 `initialize`。
 
 ```bash
 python mcp_stdio_start.py                                    # stdio

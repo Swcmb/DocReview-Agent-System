@@ -24,7 +24,7 @@ from typing import Any, cast
 from fastapi import FastAPI, HTTPException
 
 from ..workflows.review_workflow import create_workflow_runtime, run_review_workflow
-from . import core
+from . import core, streamable
 from .core import (  # noqa: F401  — 再导出以维持 http_srv.ReviewRequest 等公开名（契约测试依赖）
     HealthResponse,
     ReviewRequest,
@@ -56,7 +56,7 @@ async def health_check():
         runtime = await _get_runtime()
         return HealthResponse(
             status="healthy",
-            llm_available=True,
+            llm_available=core.llm_available(runtime),
             mcp_services=core.mcp_service_status(runtime),
         )
     except Exception as e:
@@ -187,9 +187,12 @@ async def invoke_tool(request: dict[str, Any]):
 
 
 # MCP 协议兼容的 JSON-RPC 端点
-@app.post("/")
-async def mcp_json_rpc(request: dict[str, Any]):
-    """MCP JSON-RPC 端点"""
+async def _dispatch_rpc(request: dict[str, Any]) -> dict[str, Any]:
+    """JSON-RPC 方法分发的**唯一实现**。
+
+    `POST /` 与 Streamable HTTP 的 `POST /mcp` 都委托到这里，避免两套方法
+    分发各自演化——本模块历史上正是因逻辑分散而漂移过。
+    """
     try:
         request_id = request.get("id")
         method = request.get("method")
@@ -247,6 +250,17 @@ async def mcp_json_rpc(request: dict[str, Any]):
     except Exception as e:
         logger.error(f"MCP JSON-RPC 错误: {e}")
         return core.jsonrpc_error(request.get("id"), core.ERR_INTERNAL, str(e))
+
+
+@app.post("/")
+async def mcp_json_rpc(request: dict[str, Any]):
+    """MCP JSON-RPC 端点"""
+    return await _dispatch_rpc(request)
+
+
+# 规范 Streamable HTTP 传输（`/mcp`）。与上面的 `/` 并存：老客户端继续用
+# `/`，标准客户端走 `/mcp` 并享受会话握手。
+app.include_router(streamable.build_router(_dispatch_rpc))
 
 
 async def start_server(host: str = "127.0.0.1", port: int = 8000):

@@ -40,10 +40,19 @@
 - **老客户端零影响**：旧方法名、参数形状、返回形态、错误码全部原样保留。
 - **新标准方法复用 `core` 的塑形函数**，因此同名工具在两种传输上返回
   **完全一致**的 MCP 响应（`test_http_standard_methods_are_mcp_compliant` 锁定）。
-- 这是**加法**而非统一：F8 的「schema 不变」约束未被触碰，20 份已跟踪快照
-  逐字节未变，新增 4 份快照只锁定新增能力。
-- 未覆盖：HTTP 侧仍不是完整 MCP Streamable HTTP 传输（无 GET SSE、
-  无会话管理），标准客户端若强依赖这些需自行补齐或改用 stdio 模式。
+- 这是**加法**而非统一：F8 的「schema 不变」约束未被触碰，除 `http_openapi`
+  因新增端点而纯增量外，其余已跟踪快照逐字节未变；新增快照只锁定新增能力。
+
+## Streamable HTTP 传输（`streamable.py`）
+
+2026-09 补齐规范 2025-03-26 的传输形态：`POST /mcp`（含 `Mcp-Session-Id`
+握手与校验）、`GET /mcp`（SSE 保活流）、`DELETE /mcp`（会话终结）。
+
+- 方法分发与 `POST /` **共用** `server._dispatch_rpc`，不存在两套实现。
+- 传输层错误（缺会话、会话失效、畸形 JSON）用 RFC 9457
+  `application/problem+json`，**不与 JSON-RPC 的 `error` 信封混用**。
+- 已知限制（会话仅在进程内存、SSE 不发业务消息、无 resumability）见
+  `streamable.py` 模块文档。
 
 ## 运行时缓存不在本层
 
@@ -296,6 +305,21 @@ def mcp_service_status(runtime: Mapping[str, Any]) -> dict[str, bool]:
     }
 
 
+def llm_available(runtime: Mapping[str, Any]) -> bool:
+    """LLM 客户端是否真的可用——**从 runtime 派生，不写死**。
+
+    `create_workflow_runtime()` 在 `ChatOpenAI` 构造失败（缺 `api_key`、
+    缺 `langchain-openai`）时即抛异常，所以能走到健康分支通常意味着客户端已构建。
+    但「通常」不够：若将来运行时改为允许 LLM 降级（例如无 key 时用占位客户端
+    继续启动），写死的 `True` 会静默变成谎言——健康检查报告一个并不存在的能力。
+    派生判断让该字段在任何初始化策略下都保持诚实。
+
+    注意语义边界：此处只判定**客户端已配置**，不探测远端可达性——
+    后者需要网络 I/O，不适合放进健康检查。
+    """
+    return runtime.get("llm") is not None
+
+
 # ─────────────────────── 协议信封 ───────────────────────
 
 
@@ -364,7 +388,7 @@ def shape_health_result(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "服务正常运行",
         {
             "status": "healthy",
-            "llm_available": True,
+            "llm_available": llm_available(runtime),
             "mcp_services": mcp_service_status(runtime),
         },
     )

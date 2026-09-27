@@ -37,6 +37,7 @@ SNAPSHOT_DOMAINS = {
     "http_spec_request": "HTTP 请求模型",
     "http_spec_response": "HTTP 响应模型",
     "http_health_response": "HTTP 响应模型",
+    "http_health_llm_missing": "HTTP 降级运行时",
     "http_tools": "HTTP /tools",
     "http_openapi": "HTTP OpenAPI",
     "http_jsonrpc_list_tools": "HTTP JSON-RPC",
@@ -54,6 +55,7 @@ SNAPSHOT_DOMAINS = {
     "stdio_unknown_method": "stdio JSON-RPC",
     "stdio_unknown_tool": "stdio tools/call",
     "stdio_call_health": "stdio tools/call",
+    "stdio_call_health_llm_missing": "stdio 降级运行时",
     "stdio_call_review": "stdio tools/call",
     "stdio_call_generate_spec": "stdio tools/call",
 }
@@ -68,6 +70,15 @@ class _NotDegraded:
     """`hasattr(x, "is_degraded")` 为真的最小健康 MCP 客户端。"""
 
     is_degraded = False
+
+
+class _FakeLLM:
+    """最小健康 LLM 客户端替身。
+
+    代表「运行时初始化成功」的真实形态——真实 runtime 必然含 `llm` 键。
+    缺了它，`llm_available` 派生判断会误报 False，把「健康运行时」快照
+    钉成谎话。
+    """
 
 
 class _FakeSupervisor:
@@ -109,6 +120,7 @@ async def _fake_run_review_workflow(initial_state: Any) -> dict:
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """用替身接管运行时，使契约采集不触达 LLM / MCP / checkpoint。"""
     runtime = {
+        "llm": _FakeLLM(),
         "seq_thinking": _NotDegraded(),
         "context7": _NotDegraded(),
         "supervisor": _FakeSupervisor(),
@@ -119,14 +131,33 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(stdio_srv, "run_review_workflow", _fake_run_review_workflow)
 
 
+def _install_llm_missing_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """装一个**缺 LLM 客户端**的运行时。
+
+    代表「运行时起来了但 LLM 不可用」的降级形态（写死 `True` 的旧实现
+    在此场景下会说谎——报告一个并不存在的能力）。
+    """
+    runtime = {
+        "seq_thinking": _NotDegraded(),
+        "context7": _NotDegraded(),
+        "supervisor": _FakeSupervisor(),
+    }
+    monkeypatch.setattr(http_srv, "_runtime_cache", runtime)
+    monkeypatch.setattr(stdio_srv, "_runtime_cache", runtime)
+
+
 # ─────────────────────────── 契约采集 ───────────────────────────
 
 
-async def collect_snapshots() -> dict:
+async def collect_snapshots(mp: pytest.MonkeyPatch | None = None) -> dict:
     """从真实模块采集当前对外契约。
 
     同时被本模块的测试与 `_regen_snapshots.py` 使用，保证「基线怎么生成」
     与「测试怎么比对」永远同源。
+
+    Args:
+        mp: 可选。传入后额外采集「缺 LLM 客户端」的降级运行时快照——
+            该场景需要切换 runtime，依赖 monkeypatch。
     """
     out: dict[str, Any] = {}
 
@@ -209,6 +240,14 @@ async def collect_snapshots() -> dict:
             "params": {"name": "generate_spec", "arguments": {"task": "设计认证"}},
         }
     )
+
+    # 降级运行时（缺 LLM 客户端）：`llm_available` 必须诚实报 false。
+    # 需要 monkeypatch 才能切换 runtime，故仅在传入时采集。
+    if mp is not None:
+        _install_llm_missing_runtime(mp)
+        out["http_health_llm_missing"] = (await http_srv.health_check()).model_dump()
+        out["stdio_call_health_llm_missing"] = await stdio_srv.invoke_tool("health_check", {})
+
     return out
 
 
@@ -229,9 +268,9 @@ def _read_snapshot(name: str) -> str:
 
 
 async def test_contract_snapshots_match_byte_for_byte(monkeypatch: pytest.MonkeyPatch):
-    """一次比对全部 20 份快照；任一字段增删改都会在此失败并给出完整 diff 上下文。"""
+    """一次比对全部 22 份快照；任一字段增删改都会在此失败并给出完整 diff 上下文。"""
     _install_stubs(monkeypatch)
-    live = await collect_snapshots()
+    live = await collect_snapshots(monkeypatch)
 
     assert set(live) == set(SNAPSHOT_DOMAINS), (
         f"契约集合与基线不一致：多出 {set(live) - set(SNAPSHOT_DOMAINS)}，"
@@ -486,7 +525,12 @@ async def test_http_response_models_keep_required_fields(monkeypatch: pytest.Mon
 
 
 def test_openapi_route_surface_is_frozen():
-    """不变量：对外路由面固定为 6 条（规格要求决策层接入不得增删端点）。"""
+    """不变量：对外路由面固定为 9 条。
+
+    前 6 条是既有契约（规格要求决策层接入不得增删端点）；后 3 条是
+    2026-09 批准的 MCP Streamable HTTP 传输补全（`/mcp` 的 POST/GET/DELETE）。
+    两者都不得再增删——新增端点须先改规格。
+    """
     spec = http_srv.app.openapi()
     routes = {(method.upper(), path) for path, ops in spec["paths"].items() for method in ops}
 
@@ -497,6 +541,10 @@ def test_openapi_route_surface_is_frozen():
         ("GET", "/tools"),
         ("POST", "/invoke"),
         ("POST", "/"),
+        # MCP Streamable HTTP（2025-03-26）
+        ("POST", "/mcp"),
+        ("GET", "/mcp"),
+        ("DELETE", "/mcp"),
     }
 
 

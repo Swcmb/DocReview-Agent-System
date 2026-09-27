@@ -1,0 +1,16 @@
+{
+  "content": [
+    {
+      "text": "服务正常运行",
+      "type": "text"
+    }
+  ],
+  "metadata": {
+    "llm_available": false,
+    "mcp_services": {
+      "context7": true,
+      "sequential_thinking": true
+    },
+    "status": "healthy"
+  }
+}

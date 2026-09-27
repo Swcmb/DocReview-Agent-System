@@ -147,7 +147,21 @@ JSON-RPC 端点**同时接受两套方法名**：
 | `invoke` | Pydantic 模型 | 旧方法，保留兼容 |
 
 因此标准 MCP 客户端可直接连 HTTP 模式，老客户端也不受影响。
-（HTTP 侧尚非完整 MCP Streamable HTTP 传输——无 GET SSE、无会话管理。）
+
+#### Streamable HTTP 传输（`/mcp`）
+
+另提供规范 2025-03-26 的 Streamable HTTP 端点，供标准客户端走完整握手：
+
+| 方法/路径 | 作用 |
+|---|---|
+| `POST /mcp` | 客户端 → 服务端。`initialize` 响应回传 `Mcp-Session-Id` |
+| `GET /mcp` | 服务端 → 客户端 SSE 流（本服务无主动推送，仅保活） |
+| `DELETE /mcp` | 显式终结会话（204） |
+
+- 非 `initialize` 请求**必须**带 `Mcp-Session-Id`，否则 `400`；会话失效 `404`。
+- 传输层错误用 RFC 9457 `application/problem+json`，不与 JSON-RPC `error` 信封混用。
+- **会话只存在于进程内存**：重启后全部失效，客户端须重新 `initialize`。
+  这是刻意取舍——本服务跨请求无状态，落盘只会引入无谓的持久化与清理负担。
 
 ### MCP Server（stdio 模式）
 

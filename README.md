@@ -134,7 +134,20 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/tools
 ```
 
-同时暴露 REST（`/health`、`/tools`）与 JSON-RPC（`/mcp`）。
+同时暴露 REST（`GET /health`、`GET /tools`）与 JSON-RPC 2.0（`POST /`）。
+
+JSON-RPC 端点**同时接受两套方法名**：
+
+| 方法 | 返回形态 | 说明 |
+|---|---|---|
+| `initialize` | 握手信息 | MCP 标准 |
+| `tools/list` | `inputSchema` | MCP 标准 |
+| `tools/call` | `content` + `metadata` | MCP 标准 |
+| `list_tools` | `parameters` | 旧方法，保留兼容 |
+| `invoke` | Pydantic 模型 | 旧方法，保留兼容 |
+
+因此标准 MCP 客户端可直接连 HTTP 模式，老客户端也不受影响。
+（HTTP 侧尚非完整 MCP Streamable HTTP 传输——无 GET SSE、无会话管理。）
 
 ### MCP Server（stdio 模式）
 
@@ -213,7 +226,7 @@ python scripts/build_laya_checkpoint_manifest.py \
 工具枚举走 JSON-RPC 方法 `tools/list`（HTTP 模式下另有 `list_tools` 方法与 `GET /tools`），
 它本身不是一个可调用工具。
 
-HTTP 模式额外提供 `GET /health`、`GET /tools`（REST）与 `POST /mcp`（JSON-RPC 2.0）。
+HTTP 模式额外提供 `GET /health`、`GET /tools`（REST）与 `POST /`（JSON-RPC 2.0）。
 
 ### JSON-RPC 调用示例
 

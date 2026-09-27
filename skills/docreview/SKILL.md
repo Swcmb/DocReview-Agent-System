@@ -42,15 +42,19 @@ docreview resume --thread-id review-20260520-140010 --approve
 
 ## MCP 两种模式的方法名不同（易踩）
 
-| 能力 | stdio（标准） | HTTP（**非标准**，冻结契约） |
-|---|---|---|
-| 握手 | `initialize` | 无 |
-| 列工具 | `tools/list` | `list_tools` |
-| 调工具 | `tools/call` | `invoke` |
-| 工具 schema 键 | `inputSchema` | `parameters` |
+| 能力 | stdio（标准） | HTTP 旧方法（冻结契约） | HTTP 标准方法 |
+|---|---|---|---|
+| 握手 | `initialize` | 无 | `initialize` |
+| 列工具 | `tools/list` | `list_tools` | `tools/list` |
+| 调工具 | `tools/call` | `invoke` | `tools/call` |
+| 工具 schema 键 | `inputSchema` | `parameters` | `inputSchema` |
+| 结果信封 | `content` + `metadata` | Pydantic 模型 | `content` + `metadata` |
 
-**用标准 MCP 客户端连 HTTP 会失败**（它发 `tools/call`，HTTP 侧只认 `invoke`）。
-这是规格 F8 冻结的既有分歧，不是缺陷；改动需先改规格并重生成快照。
+**标准 MCP 客户端现在可以连 HTTP 模式**：发 `initialize` / `tools/list` / `tools/call`
+即可，返回形态与 stdio 逐字段一致。旧方法名与返回形态原样保留，老客户端零影响。
+
+> HTTP 侧仍非完整 MCP Streamable HTTP 传输（无 GET SSE、无会话管理）；
+> 强依赖这两项的客户端请改用 stdio 模式。
 
 ```bash
 python mcp_stdio_start.py                                    # stdio
@@ -109,7 +113,7 @@ python -m mypy src/                 # 75 errors in 14 files（历史债务）
 | CLI 报缺密钥 | `.env` 未填或变量名用了单下划线 |
 | 决策层不生效 | 默认关闭，需显式 `--laya`；且权重与校准包须齐备 |
 | 改 MCP 后快照测试失败 | 契约已冻结，勿改字段；确需变更先改规格再跑 `python -m tests.test_mcp_server._regen_snapshots` |
-| HTTP 模式 `tools/call` 报未知方法 | 见上文方法名差异，改用 `invoke` 或改走 stdio |
+| HTTP 模式 `tools/call` 报未知方法 | 检查是否打到 `POST /`（不是 `/mcp`）；方法名拼写须为 `tools/call`，参数放 `params.name` |
 | 内存闸门恒不触发 | 必须做负向验证（阈值调到必然超标，确认退出码非零） |
 
 日志在 `logs/`，checkpoint 在 `data/checkpoints.db`（支持损坏检测与恢复）。

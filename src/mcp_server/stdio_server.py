@@ -71,19 +71,7 @@ async def review_document(doc_path: str | None = None, task: str | None = None, 
 
         request = ReviewRequest(doc_path=doc_path, task=task, max_iterations=max_iterations)
         result = await run_review_workflow(core.build_review_state(request))
-        reports, issues = core.collect_reports(result)
-
-        return core.text_result(
-            core.summarize_issues(issues),
-            {
-                "success": True,
-                "review_conclusion": result.get("review_conclusion", "unknown"),
-                "iteration_count": result.get("iteration_count", 0),
-                "total_llm_cost": result.get("total_llm_cost", 0.0),
-                "issue_count": len(issues),
-                "reports": reports,
-            },
-        )
+        return core.shape_review_result(result)
 
     except Exception as e:
         logger.error(f"审查失败: {e}", exc_info=True)
@@ -100,14 +88,7 @@ async def generate_spec(task: str, document_content: str | None = None) -> dict[
 
         request = SpecGenerateRequest(task=task, document_content=document_content)
         state = await supervisor.generate_spec(core.build_spec_state(request))
-
-        return core.text_result(
-            state.get("specification", ""),
-            {
-                "success": True,
-                "spec_version": state.get("spec_version", 1),
-            },
-        )
+        return core.shape_spec_result(state)
 
     except Exception as e:
         logger.error(f"规格生成失败: {e}", exc_info=True)
@@ -118,25 +99,10 @@ async def health_check() -> dict[str, Any]:
     """健康检查"""
     try:
         runtime = await _get_runtime()
-        return core.text_result(
-            "服务正常运行",
-            {
-                "status": "healthy",
-                "llm_available": True,
-                "mcp_services": core.mcp_service_status(runtime),
-            },
-        )
+        return core.shape_health_result(runtime)
     except Exception as e:
         logger.error(f"健康检查失败: {e}")
-        return core.text_result(
-            f"服务异常: {str(e)}",
-            {
-                "status": "unhealthy",
-                "llm_available": False,
-                "mcp_services": {"sequential_thinking": False, "context7": False},
-                "error": str(e),
-            },
-        )
+        return core.shape_health_error(str(e))
 
 
 async def invoke_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -163,18 +129,7 @@ async def process_request(request: dict[str, Any]) -> dict[str, Any]:
         if method == "initialize":
             """初始化连接 - MCP 客户端在连接时调用"""
             logger.info("客户端初始化连接")
-            return core.jsonrpc_result(
-                request_id,
-                {
-                    "protocolVersion": core.PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {
-                        "name": core.SERVER_NAME,
-                        "version": core.SERVER_VERSION,
-                        "description": core.SERVER_DESCRIPTION,
-                    },
-                },
-            )
+            return core.jsonrpc_result(request_id, core.initialize_result())
 
         elif method == "tools/list":
             """列出可用工具"""

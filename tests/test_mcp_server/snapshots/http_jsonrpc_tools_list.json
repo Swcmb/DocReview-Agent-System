@@ -1,0 +1,62 @@
+{
+  "id": 7,
+  "jsonrpc": "2.0",
+  "result": {
+    "tools": [
+      {
+        "description": "执行文档审查，对产品需求文档、技术方案等进行六步审查",
+        "inputSchema": {
+          "properties": {
+            "doc_path": {
+              "description": "待审查文档路径",
+              "type": "string"
+            },
+            "max_iterations": {
+              "description": "最大审查迭代次数",
+              "type": "integer"
+            },
+            "task": {
+              "description": "任务描述",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "review_document",
+        "title": "文档审查"
+      },
+      {
+        "description": "根据任务描述生成结构化规格文档",
+        "inputSchema": {
+          "properties": {
+            "document_content": {
+              "description": "参考文档内容",
+              "type": "string"
+            },
+            "task": {
+              "description": "任务描述",
+              "type": "string"
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "type": "object"
+        },
+        "name": "generate_spec",
+        "title": "规格文档生成"
+      },
+      {
+        "description": "检查 MCP Server 健康状态",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "health_check",
+        "title": "健康检查"
+      }
+    ]
+  }
+}

@@ -3,9 +3,15 @@
 本模块只负责 HTTP/REST 与 JSON-RPC 协议信封。工具定义、请求模型、降级判断与
 结果拼装等**共享逻辑**位于 `src/mcp_server/core.py`，是 HTTP 与 stdio 的唯一真相源。
 
-⚠️ 契约冻结：对外 schema 由 `tests/test_mcp_server/test_contract.py` 的 22 份快照
-逐字节锁定。本层**不得**改变任何字段增删；HTTP 与 stdio 的已知分歧（如 `parameters`
-vs `inputSchema`）是既有契约而非缺陷，详见 core.py 模块文档。
+⚠️ 契约冻结：对外 schema 由 `tests/test_mcp_server/test_contract.py` 的快照层
+逐字节锁定。本层**不得**改变任何既有字段增删；HTTP 与 stdio 在**旧方法**上的
+已知分歧（如 `parameters` vs `inputSchema`）是既有契约而非缺陷，详见 core.py 模块文档。
+
+✅ 标准方法（零破坏增量）：JSON-RPC 端点额外接受 MCP 标准方法名
+`initialize` / `tools/list` / `tools/call`，返回规范形态（`inputSchema` +
+`content`/`metadata`），使标准 MCP 客户端可连接本模式；旧方法 `list_tools` /
+`invoke` 的名称、参数形状、返回形态与错误码全部原样保留，老客户端零影响。
+两套方法并存由 `test_http_standard_methods_are_mcp_compliant` 锁定。
 
 `_runtime_cache` 与 `run_review_workflow` 刻意保留在本模块命名空间：契约测试按模块
 monkeypatch 这两个名字，收敛到 core 会使替身失效并触达真实 LLM。
@@ -127,6 +133,34 @@ async def list_tools():
     return {"tools": core.render_tools_http()}
 
 
+# ─────────── MCP 规范方法（供标准 MCP 客户端使用）───────────
+# 旧方法 `list_tools` / `invoke` 返回 HTTP 形态（`parameters`）并被契约快照逐字节锁定；
+# 标准方法 `tools/list` / `tools/call` 返回 MCP 规范形态（`inputSchema` + content/metadata）。
+# 两者并存：老客户端零破坏，新客户端可用标准握手。
+
+
+async def _mcp_call_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """按 MCP 规范返回 `content`/`metadata` 信封（与 stdio 同形状）。"""
+    if tool_name == "review_document":
+        result = await run_review_workflow(core.build_review_state(ReviewRequest(**arguments)))
+        return core.shape_review_result(result)
+
+    if tool_name == "generate_spec":
+        runtime = await _get_runtime()
+        state = await runtime["supervisor"].generate_spec(
+            core.build_spec_state(SpecGenerateRequest(**arguments))
+        )
+        return core.shape_spec_result(state)
+
+    if tool_name == "health_check":
+        try:
+            return core.shape_health_result(await _get_runtime())
+        except Exception as e:
+            return core.shape_health_error(str(e))
+
+    return core.unknown_tool_result(tool_name)
+
+
 @app.post("/invoke")
 async def invoke_tool(request: dict[str, Any]):
     """通用工具调用接口（MCP JSON-RPC 兼容）"""
@@ -163,6 +197,22 @@ async def mcp_json_rpc(request: dict[str, Any]):
 
         if request.get("jsonrpc") != "2.0":
             return core.jsonrpc_error(request_id, core.ERR_INVALID_REQUEST, "无效的 JSON-RPC 版本")
+
+        # ── MCP 标准方法：标准客户端握手路径，返回规范形态 ──
+        if method == "initialize":
+            return core.jsonrpc_result(request_id, core.initialize_result())
+
+        if method == "tools/list":
+            return core.jsonrpc_result(request_id, {"tools": core.render_tools_stdio()})
+
+        if method == "tools/call":
+            if not isinstance(params, dict) or not params.get("name"):
+                return core.jsonrpc_error(request_id, core.ERR_INVALID_PARAMS, "缺少工具名称")
+            payload = await _mcp_call_tool(
+                cast("str", params["name"]),
+                cast("dict[str, Any]", params.get("arguments", {})),
+            )
+            return core.jsonrpc_result(request_id, payload)
 
         if method == "list_tools":
             return core.jsonrpc_result(request_id, await list_tools())

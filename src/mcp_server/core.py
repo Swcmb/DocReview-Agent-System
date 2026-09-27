@@ -11,7 +11,7 @@
 以下差异是**已冻结的对外契约**，由 `tests/test_mcp_server/test_contract.py`
 的快照层与不变量层逐字节锁定，**不可**在此统一：
 
-| 维度 | HTTP | stdio |
+| 维度 | HTTP（旧方法） | stdio |
 |---|---|---|
 | 工具 schema 键 | `parameters`（含 `optional`/`default` 标记） | `inputSchema`（JSON Schema，含 `required` 数组） |
 | 工具 `title` 字段 | 无 | 有 |
@@ -23,6 +23,27 @@
 
 统一它们需要先改规格 F8 并重生成快照，不在本次优化范围内。
 若将来要统一，请先改规格，再跑 `python -m tests.test_mcp_server._regen_snapshots`。
+
+## HTTP 侧的标准方法（2026-09 增量，零破坏）
+
+上表的分歧**仍然存在**，但 HTTP 侧额外接受 MCP 标准方法名，使标准 MCP 客户端
+可以连上 HTTP 模式：
+
+| 标准方法 | HTTP 返回 | 对应旧方法 |
+|---|---|---|
+| `initialize` | 与 stdio 逐字段相同 | 无 |
+| `tools/list` | `inputSchema` 形态（规范） | `list_tools` → `parameters` |
+| `tools/call` | `content` + `metadata` 信封（规范） | `invoke` → Pydantic 模型 |
+
+要点：
+
+- **老客户端零影响**：旧方法名、参数形状、返回形态、错误码全部原样保留。
+- **新标准方法复用 `core` 的塑形函数**，因此同名工具在两种传输上返回
+  **完全一致**的 MCP 响应（`test_http_standard_methods_are_mcp_compliant` 锁定）。
+- 这是**加法**而非统一：F8 的「schema 不变」约束未被触碰，20 份已跟踪快照
+  逐字节未变，新增 4 份快照只锁定新增能力。
+- 未覆盖：HTTP 侧仍不是完整 MCP Streamable HTTP 传输（无 GET SSE、
+  无会话管理），标准客户端若强依赖这些需自行补齐或改用 stdio 模式。
 
 ## 运行时缓存不在本层
 
@@ -257,7 +278,7 @@ def summarize_issues(issues: list[dict[str, Any]]) -> str:
 # ─────────────────────── 运行时健康状态 ───────────────────────
 
 
-def _service_ok(runtime: dict[str, Any], key: str) -> bool:
+def _service_ok(runtime: Mapping[str, Any], key: str) -> bool:
     """MCP 子服务是否健康（未降级）。
 
     与重构前逐字等价（含 `{}` 缺省值）：客户端对象没有 `is_degraded`
@@ -267,7 +288,7 @@ def _service_ok(runtime: dict[str, Any], key: str) -> bool:
     return not client.is_degraded if hasattr(client, "is_degraded") else False
 
 
-def mcp_service_status(runtime: dict[str, Any]) -> dict[str, bool]:
+def mcp_service_status(runtime: Mapping[str, Any]) -> dict[str, bool]:
     """两个 MCP 子服务的健康状态（重构前此逻辑在两个文件里重复）。"""
     return {
         "sequential_thinking": _service_ok(runtime, "seq_thinking"),
@@ -302,3 +323,74 @@ def unknown_tool_result(tool_name: str) -> dict[str, Any]:
     """stdio 未知工具：按契约返回 `result` 而非 JSON-RPC `error`。"""
     message = f"未知工具: {tool_name}"
     return text_result(message, {"success": False, "error": message})
+
+
+# ─────────────────────── MCP 规范形态的结果塑形 ───────────────────────
+# 下面三个函数把「领域结果」转成 MCP 规范的 content/metadata 信封。
+# stdio 侧与 HTTP 的标准方法（tools/call）共用，保证两种传输对同一工具
+# 产出**完全一致**的 MCP 响应——这是 HTTP 模式能服务标准客户端的前提。
+
+
+def shape_review_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """工作流结果 → MCP `review_document` 响应。"""
+    reports, issues = collect_reports(result)
+    return text_result(
+        summarize_issues(issues),
+        {
+            "success": True,
+            "review_conclusion": result.get("review_conclusion", "unknown"),
+            "iteration_count": result.get("iteration_count", 0),
+            "total_llm_cost": result.get("total_llm_cost", 0.0),
+            "issue_count": len(issues),
+            "reports": reports,
+        },
+    )
+
+
+def shape_spec_result(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Supervisor 状态 → MCP `generate_spec` 响应。"""
+    return text_result(
+        state.get("specification", ""),
+        {"success": True, "spec_version": state.get("spec_version", 1)},
+    )
+
+
+def shape_health_result(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    """运行时 → MCP `health_check` 成功响应。
+
+    注意：按冻结契约，此 metadata **不含** `success` 字段。
+    """
+    return text_result(
+        "服务正常运行",
+        {
+            "status": "healthy",
+            "llm_available": True,
+            "mcp_services": mcp_service_status(runtime),
+        },
+    )
+
+
+def shape_health_error(error: str) -> dict[str, Any]:
+    """运行时初始化失败 → MCP `health_check` 失败响应。"""
+    return text_result(
+        f"服务异常: {error}",
+        {
+            "status": "unhealthy",
+            "llm_available": False,
+            "mcp_services": {"sequential_thinking": False, "context7": False},
+            "error": error,
+        },
+    )
+
+
+def initialize_result() -> dict[str, Any]:
+    """MCP `initialize` 握手结果（两种传输共用同一形状）。"""
+    return {
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {"tools": {}},
+        "serverInfo": {
+            "name": SERVER_NAME,
+            "version": SERVER_VERSION,
+            "description": SERVER_DESCRIPTION,
+        },
+    }

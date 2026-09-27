@@ -44,6 +44,10 @@ SNAPSHOT_DOMAINS = {
     "http_jsonrpc_unknown_method": "HTTP JSON-RPC",
     "http_jsonrpc_invoke_health": "HTTP JSON-RPC",
     "http_jsonrpc_invoke_params_list": "HTTP JSON-RPC",
+    "http_jsonrpc_initialize": "HTTP 标准方法",
+    "http_jsonrpc_tools_list": "HTTP 标准方法",
+    "http_jsonrpc_tools_call_health": "HTTP 标准方法",
+    "http_jsonrpc_tools_call_missing_name": "HTTP 标准方法",
     "stdio_initialize": "stdio 握手",
     "stdio_tools_list": "stdio tools/list",
     "stdio_tools_call_missing_name": "stdio tools/call",
@@ -160,6 +164,25 @@ async def collect_snapshots() -> dict:
         }
     )
 
+    # HTTP 侧的标准 MCP 方法（返回规范形态，与旧方法并存互不影响）
+    out["http_jsonrpc_initialize"] = await http_srv.mcp_json_rpc(
+        {"jsonrpc": "2.0", "id": 6, "method": "initialize"}
+    )
+    out["http_jsonrpc_tools_list"] = await http_srv.mcp_json_rpc(
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
+    )
+    out["http_jsonrpc_tools_call_health"] = await http_srv.mcp_json_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "health_check", "arguments": {}},
+        }
+    )
+    out["http_jsonrpc_tools_call_missing_name"] = await http_srv.mcp_json_rpc(
+        {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {}}
+    )
+
     out["stdio_initialize"] = await stdio_srv.process_request({"id": 1, "method": "initialize"})
     out["stdio_tools_list"] = await stdio_srv.process_request({"id": 2, "method": "tools/list"})
     out["stdio_tools_call_missing_name"] = await stdio_srv.process_request(
@@ -268,6 +291,59 @@ async def test_http_and_stdio_schema_keys_diverge(monkeypatch: pytest.MonkeyPatc
     assert "parameters" in http_tool and "inputSchema" not in http_tool
     assert "inputSchema" in stdio_tool and "parameters" not in stdio_tool
     assert stdio_tool["inputSchema"]["type"] == "object"
+
+
+async def test_http_standard_methods_are_mcp_compliant(monkeypatch: pytest.MonkeyPatch):
+    """不变量：HTTP 侧新增的标准方法返回 **MCP 规范形态**，旧方法形态不变。
+
+    2026-09 增量引入，非破坏：`list_tools`/`invoke` 仍返回 HTTP 形态（`parameters`），
+    而 `tools/list`/`tools/call` 返回规范形态（`inputSchema` + content/metadata）。
+    这使标准 MCP 客户端能连上 HTTP 模式，同时老客户端零改动。
+    """
+    _install_stubs(monkeypatch)
+
+    # 标准 tools/list 必须给 inputSchema，否则标准客户端无法解析工具定义
+    std_shape = (
+        await http_srv.mcp_json_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    )["result"]["tools"][0]
+    assert "inputSchema" in std_shape and "parameters" not in std_shape
+
+    # 旧 list_tools 形态必须原样保留（老客户端依赖 parameters）
+    legacy = (await http_srv.list_tools())["tools"][0]
+    assert "parameters" in legacy and "inputSchema" not in legacy
+
+    # 标准 tools/call 必须返回 content/metadata 信封
+    called = await http_srv.mcp_json_rpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "health_check", "arguments": {}},
+        }
+    )
+    assert called["result"]["metadata"]["status"] == "healthy"
+    assert called["result"]["content"][0]["type"] == "text"
+
+    # 两侧同名工具的响应形状应完全一致（塑形逻辑共用 core）
+    stdio_called = await stdio_srv.process_request(
+        {
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "health_check", "arguments": {}},
+        }
+    )
+    assert called["result"] == stdio_called["result"]
+
+
+async def test_http_standard_handshake_matches_stdio(monkeypatch: pytest.MonkeyPatch):
+    """不变量：两种传输的 `initialize` 握手结果完全相同。"""
+    _install_stubs(monkeypatch)
+
+    http_init = await http_srv.mcp_json_rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    stdio_init = await stdio_srv.process_request({"id": 1, "method": "initialize"})
+
+    assert http_init["result"] == stdio_init["result"]
+    assert http_init["result"]["protocolVersion"] == "2024-11-05"
 
 
 async def test_stdio_required_lists_are_frozen(monkeypatch: pytest.MonkeyPatch):
